@@ -8,5 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+.env
 qwen3-8B/
 draft.ipynb
