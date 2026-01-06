@@ -2,7 +2,7 @@
 
 **Goal: DR Agent完成带引用的long-form reports和short-from answers. 强调DR Agent通过连续地使用搜索工具并不断地调整其搜索广度和搜索深度获得精确的问题回答和深度的长篇报告**
 
-![dr_agent.png](attachment:9577dc89-4a21-450e-a512-08ab30ad3a06:dr_agent.png)
+![dr_agent.png](./dr_agent.png)
 
 ### Agent architecture
 

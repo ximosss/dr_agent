@@ -1,5 +1,6 @@
 import os
 import json
+from pathlib import Path
 import asyncio
 
 from typing import Optional
@@ -9,8 +10,8 @@ load_dotenv()
 
 from agents import Agent, Runner, set_tracing_disabled
 from agents.extensions.models.litellm_model import LitellmModel
-import weave
-from utils.helpers import strip_think_block
+import wandb, weave
+from utils.helpers import strip_think_block, setup_loguru
 
 from tools import web_search, paper_search, local_docs_lookup, summarize_sources
 from prompt import (
@@ -108,7 +109,6 @@ async def get_local_context(local_files_path: str, question: str) -> Optional[st
     if not local_files_path:
         return None
 
-    # Call the tool directly
     from tools import local_docs_lookup
     result = await local_docs_lookup.on_invoke_tool(
         ctx=None,
@@ -143,7 +143,6 @@ async def clarify_intent(
     result = await Runner.run(intent_agent, message)
     output = strip_think_block(result.final_output)
 
-    # Parse the intent (simplified - in production would use structured output)
     return {
         "question": question,
         "clarified_intent": output,
@@ -178,9 +177,7 @@ Output a JSON array of search objectives.
     result = await Runner.run(planning_agent, message)
     output = strip_think_block(result.final_output)
 
-    # Parse JSON from output
     try:
-        # Try to extract JSON from the output
         json_start = output.find('[')
         json_end = output.rfind(']') + 1
         if json_start != -1 and json_end > json_start:
@@ -190,7 +187,6 @@ Output a JSON array of search objectives.
     except json.JSONDecodeError:
         objectives_json = []
 
-    # Create plan
     plan = ResearchPlan(
         user_question=clarified_intent['question'],
         research_type="long-form" if "report" in clarified_intent['clarified_intent'].lower() else "short-form",
@@ -268,7 +264,7 @@ Execute this search objective using the appropriate tool. After getting results,
 provide a brief summary of what you found that's relevant to the research question.
 """
 
-        result = await Runner.run(main_agent, task_message, max_turns=300)
+        result = await Runner.run(main_agent, task_message, max_turns=30)
         output = strip_think_block(result.final_output)
 
         # Update plan with results
@@ -367,6 +363,11 @@ async def human_in_the_loop() -> tuple[str, Optional[str]]:
 
 
 async def main():
+
+    # logger
+    run_dir = Path("runs") / wandb.run.id           
+    setup_loguru(str(run_dir))
+
     # Pre-loop: Human in the loop - collect question and context
     question, local_files_path = await human_in_the_loop()
     if not question:
@@ -424,47 +425,7 @@ async def main():
     print("="*60)
     print(final_report)
     print("="*60)
-
-    # Refinement loop
-    while True:
-        print("\n[Refinement] Enter follow-up question, 'new' for new research, or 'quit' to exit:")
-        user_input = input("> ").strip()
-
-        if not user_input:
-            continue
-        if user_input.lower() == 'quit':
-            print("\nThank you for using Deep Research Agent!")
-            break
-        if user_input.lower() == 'new':
-            return await main()
-
-        # Handle follow-up
-        print("\n[Processing follow-up...]")
-        follow_up_agent = Agent(
-            name="FollowUpAgent",
-            instructions=SYSTEM_PROMPT,
-            model=create_model(),
-            tools=[web_search, paper_search, local_docs_lookup, summarize_sources],
-        )
-
-        follow_up_message = f"""
-Previous research on: {question}
-
-Previous findings summary:
-{final_report[:2000]}...
-
-User's follow-up question: {user_input}
-
-Please answer the follow-up question, using additional searches if needed.
-"""
-        result = await Runner.run(follow_up_agent, follow_up_message, max_turns=30)
-        output = strip_think_block(result.final_output)
-
-        print("\n" + "="*60)
-        print("FOLLOW-UP RESPONSE")
-        print("="*60)
-        print(output)
-        print("="*60)
+    print("\n[End] Thank you for using Deep Research Agent!")
 
 
 if __name__ == "__main__":
