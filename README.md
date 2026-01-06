@@ -16,16 +16,14 @@ A deep research agent that performs multi-source research by searching the web a
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/ximosss/dr_agent.git
 cd dr-agent
 
 # Create and activate virtual environment
-python -m venv .venv
+uv venv
 source .venv/bin/activate
 
-# Install dependencies
-pip install -r requirements.txt
-# or with uv
+# Install dependencies with uv
 uv sync
 ```
 
@@ -37,6 +35,9 @@ Create a `.env` file with the following variables:
 MODEL_NAME_AT_ENDPOINT=<model-name>
 BASE_KEY=<api-key>
 BASE_URL=<vllm-endpoint-url>
+
+# optinal 
+WANDB_API_KEY=<api_key>
 ```
 
 > Note: The agent uses HTTP/HTTPS proxy on `localhost:8081`.
@@ -99,6 +100,3 @@ The codebase uses Pydantic models for structured data:
 - Python >= 3.11
 - vLLM endpoint with Qwen3-8B (or compatible model)
 
-## License
-
-MIT
