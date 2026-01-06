@@ -2,6 +2,9 @@
 
 A deep research agent that performs multi-source research by searching the web and academic papers, then summarizing findings. Built with OpenAI Agents SDK and powered by a self-hosted LLM backend (vLLM with Qwen3-8B).
 
+[dr_agent.png](./dr_agent.png)
+
+
 ## Features
 
 - **Web Search** - Search the web via DuckDuckGo, crawl pages with crawl4ai, extract main content with trafilatura/readability
