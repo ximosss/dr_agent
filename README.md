@@ -51,14 +51,29 @@ Notes:
 ## Run
 
 ```bash
-uv run agent.py
+uv run run_agent.py
 ```
+
+Non-interactive search:
+
+```bash
+uv run run_agent.py --search "your question"
+```
+
+Benchmark evaluation:
+
+```bash
+uv run run_agent.py --eval -b simpleqa -n 50
+```
+
+Search/interact reports are written to `results/`, evaluation outputs to `eval_outputs/`, and logs to `logs/`.
 
 ## Structure
 
 ```text
 dr_agent/
-├── agent.py        # Main interactive loop
+├── run_agent.py    # CLI entrypoint
+├── agent.py        # Core agent logic
 ├── models.py       # SearchObjective / ResearchPlan
 ├── prompt.py       # Agent prompts
 └── tools/          # Active tool implementations

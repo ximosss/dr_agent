@@ -45,8 +45,11 @@ def run_query_local_docs(search_term: str, docs_dir: str = str(LOCAL_DOCS_DIR)) 
     pdf_files = list(docs_path.glob("*.pdf"))
     md_files = list(docs_path.glob("*.md"))
     txt_files = list(docs_path.glob("*.txt"))
+    csv_files = list(docs_path.glob("*.csv"))
+    tsv_files = list(docs_path.glob("*.tsv"))
+    json_files = list(docs_path.glob("*.json"))
 
-    if not (pdf_files + md_files + txt_files):
+    if not (pdf_files + md_files + txt_files + csv_files + tsv_files + json_files):
         return "[NO_LOCAL_DOCS] No documents found in local docs directory."
 
     results = []
@@ -56,7 +59,7 @@ def run_query_local_docs(search_term: str, docs_dir: str = str(LOCAL_DOCS_DIR)) 
         content = pymupdf4llm.to_markdown(str(pdf), show_progress=False)
         _extract_matches(content, term_lower, str(pdf), results)
 
-    for txt_file in md_files + txt_files:
+    for txt_file in md_files + txt_files + csv_files + tsv_files + json_files:
         content = txt_file.read_text(encoding="utf-8", errors="ignore")
         _extract_matches(content, term_lower, str(txt_file), results)
 
@@ -83,7 +86,7 @@ def _preview_directory(path: Path, max_chars: int) -> str:
         snippet = ""
         if suffix == ".pdf":
             snippet = run_read_pdf(str(candidate), max_pages=10)
-        elif suffix in {".md", ".txt"}:
+        elif suffix in {".md", ".txt", ".csv", ".tsv", ".json"}:
             snippet = _read_text_file(candidate, min(remaining, 4000))
 
         if not snippet:
@@ -112,7 +115,7 @@ def run_local_docs_lookup(
     if path.is_file():
         if path.suffix.lower() == ".pdf":
             return truncate_text(run_read_pdf(str(path)), max_chars)
-        if path.suffix.lower() in {".md", ".txt"}:
+        if path.suffix.lower() in {".md", ".txt", ".csv", ".tsv", ".json"}:
             return _read_text_file(path, max_chars)
         return f"[UNSUPPORTED_FILE] Unsupported local file type: {path.suffix}"
 

@@ -8,7 +8,7 @@ from prompt import FETCH_WEBPAGE_TOOL_PROMPT
 from .utils import clean_whitespace, truncate_text
 
 
-def run_fetch_webpage(url: str, max_chars: int = 8000) -> str:
+def run_fetch_webpage(url: str, max_chars: int = 10000) -> str:
     """Fetch a webpage and extract markdown content."""
     if not url.startswith("http"):
         return "[INVALID_URL] URL must start with http:// or https://"

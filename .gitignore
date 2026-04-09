@@ -10,3 +10,6 @@ wheels/
 .venv
 .env
 notebooks/
+logs/
+results/
+eval_outputs/
