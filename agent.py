@@ -1,19 +1,18 @@
 import os
 import json
-from pathlib import Path
 import asyncio
+import re
 
 from typing import Optional
-from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()
 
 from agents import Agent, Runner, set_tracing_disabled
 from agents.extensions.models.litellm_model import LitellmModel
-import wandb, weave
-from utils.helpers import strip_think_block, setup_loguru
+import weave
 
-from tools import web_search, paper_search, local_docs_lookup, summarize_sources
+from models import ResearchPlan, SearchObjective
+from tools import fetch_webpage, local_docs_lookup, paper_search, web_search
 from prompt import (
     SYSTEM_PROMPT,
     INTENT_CLARIFICATION_PROMPT,
@@ -21,87 +20,23 @@ from prompt import (
     POLISH_PROMPT,
 )
 
-os.environ["HTTP_PROXY"] = "http://localhost:8081"
-os.environ["HTTPS_PROXY"] = "http://localhost:8081"
-
 set_tracing_disabled(disabled=True)
 
-model = os.getenv("MODEL_NAME_AT_ENDPOINT")
-api_key = os.getenv("BASE_KEY")
-base_url = os.getenv("BASE_URL")
-
-weave.init("ximo_ml/deep_research_agent")
-
-
-@dataclass
-class SearchObjective:
-    """Single search objective in the research plan."""
-    objective_id: int
-    description: str
-    search_type: str  # "web" | "paper" | "local"
-    mode: Optional[str] = None  # For papers: "precise" | "broad"
-    priority: str = "medium"  # "high" | "medium" | "low"
-    status: str = "pending"  # "pending" | "in_progress" | "completed"
-    keywords: list[str] = field(default_factory=list)
-    result_summary: Optional[str] = None
-
-
-@dataclass
-class ResearchPlan:
-    """Context-offloaded research plan (todo list)."""
-    user_question: str
-    research_type: str  # "short-form" | "long-form"
-    local_context_summary: Optional[str] = None
-    objectives: list[SearchObjective] = field(default_factory=list)
-    collected_sources: list[dict] = field(default_factory=list)
-
-    def to_context_string(self) -> str:
-        """Convert plan to string for agent context."""
-        lines = [
-            f"Research Question: {self.user_question}",
-            f"Type: {self.research_type}",
-        ]
-        if self.local_context_summary:
-            lines.append(f"Local Context: {self.local_context_summary[:500]}...")
-
-        lines.append("\nSearch Plan:")
-        for obj in self.objectives:
-            status_icon = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}[obj.status]
-            lines.append(f"  {status_icon} #{obj.objective_id} [{obj.priority}] {obj.description}")
-            if obj.result_summary:
-                lines.append(f"      Result: {obj.result_summary[:200]}...")
-
-        return "\n".join(lines)
-
-    def get_next_objective(self) -> Optional[SearchObjective]:
-        """Get next pending objective by priority."""
-        priority_order = {"high": 0, "medium": 1, "low": 2}
-        pending = [o for o in self.objectives if o.status == "pending"]
-        if not pending:
-            return None
-        pending.sort(key=lambda x: priority_order.get(x.priority, 1))
-        return pending[0]
-
-    def mark_completed(self, objective_id: int, result_summary: str):
-        """Mark an objective as completed."""
-        for obj in self.objectives:
-            if obj.objective_id == objective_id:
-                obj.status = "completed"
-                obj.result_summary = result_summary
-                break
-
-    def all_completed(self) -> bool:
-        """Check if all objectives are completed."""
-        return all(o.status == "completed" for o in self.objectives)
+weave.init(os.getenv("WEAVE_PROJECT"))
 
 
 def create_model():
     """Create the LiteLLM model for agents."""
     return LitellmModel(
-        model="hosted_vllm/" + model,
-        base_url=base_url,
-        api_key=api_key
+        model="hosted_vllm/" + os.getenv("MODEL_NAME_AT_ENDPOINT"),
+        base_url=os.getenv("BASE_URL"),
+        api_key=os.getenv("BASE_KEY")
     )
+
+
+def strip_think_block(text: str) -> str:
+    pattern = r"<think>[\s\S]*?</think>\s*"
+    return re.sub(pattern, "", text)
 
 
 async def get_local_context(local_files_path: str, question: str) -> Optional[str]:
@@ -109,13 +44,11 @@ async def get_local_context(local_files_path: str, question: str) -> Optional[st
     if not local_files_path:
         return None
 
-    from tools import local_docs_lookup
-    result = await local_docs_lookup.on_invoke_tool(
-        ctx=None,
-        input=json.dumps({
-            "local_files_path": local_files_path,
-            "question": question,
-        })
+    from tools import run_local_docs_lookup
+
+    result = run_local_docs_lookup(
+        local_files_path=local_files_path,
+        question=question,
     )
     return result if result else None
 
@@ -236,7 +169,7 @@ async def execute_search_plan(plan: ResearchPlan) -> ResearchPlan:
         name="DeepResearchAgent",
         instructions=SYSTEM_PROMPT,
         model=create_model(),
-        tools=[web_search, paper_search, local_docs_lookup, summarize_sources],
+        tools=[web_search, fetch_webpage, paper_search, local_docs_lookup],
     )
 
     while not plan.all_completed():
@@ -363,10 +296,7 @@ async def human_in_the_loop() -> tuple[str, Optional[str]]:
 
 
 async def main():
-
-    # logger
-    run_dir = Path("runs") / wandb.run.id           
-    setup_loguru(str(run_dir))
+    # init_observability()
 
     # Pre-loop: Human in the loop - collect question and context
     question, local_files_path = await human_in_the_loop()

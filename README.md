@@ -1,105 +1,70 @@
 # DR-Agent
 
-A deep research agent that performs multi-source research by searching the web and academic papers, then summarizing findings. Built with OpenAI Agents SDK and powered by a self-hosted LLM backend (vLLM with Qwen3-8B).
+A small deep-research agent built on the OpenAI Agents SDK. It asks the model to clarify intent, create a search plan, execute web/paper/local lookups, and synthesize a final answer.
 
-![dr_agent.png](./dr_agent.png)
-
-
-## Features
-
-- **Web Search** - Search the web via DuckDuckGo, crawl pages with crawl4ai, extract main content with trafilatura/readability
-- **Paper Search** - Academic paper search with two modes:
-  - `precise`: DDG search + Semantic Scholar enrichment for specific papers
-  - `broad`: Direct Semantic Scholar API for topic searches
-- **Local Docs Lookup** - Read local files/directories, convert to markdown, and summarize
-- **Source Summarization** - Generate structured JSON summaries from fetched documents
-- **Human-in-the-Loop** - Interactive agent loop with user feedback integration
 
 ## Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/ximosss/dr_agent.git
-cd dr-agent
-
-# Create and activate virtual environment
 uv venv
 source .venv/bin/activate
-
-# Install dependencies with uv
 uv sync
 ```
 
-## Configuration
+## Environment
 
-Create a `.env` file with the following variables:
+Create `.env` from `.env.example` and fill the values you need:
 
 ```env
-MODEL_NAME_AT_ENDPOINT=<model-name>
-BASE_KEY=<api-key>
-BASE_URL=<vllm-endpoint-url>
+# ── Inference Backend ──────────────────────────────────────────────
+MODEL_NAME_AT_ENDPOINT=
+BASE_KEY=
+BASE_URL=
 
-# optinal 
-WANDB_API_KEY=<api_key>
+# ── Search APIs (at least configure TAVILY_API_KEY) ──────────────
+TAVILY_API_KEY=
+S2_API_KEY=
+LOCAL_DOCS_DIR=
+
+# ── Experiment Tracking ───────────────────────────────────────────
+WANDB_API_KEY=
+WEAVE_PROJECT=
+
+# ── Teacher Model (for data collection) ──────────────────────────
+OPENAI_API_KEY=sk-xxxxxxxxxxxx      # Only for collecting training data
+
+# Download Datasets.(Note: You may need to obtain authorization on the dataset page.)
+HF_TOKEN=
+
+# Local_docs Path
+LOCAL_DOCS_DIR=
+
 ```
 
-> Note: The agent uses HTTP/HTTPS proxy on `localhost:8081`.
+Notes:
 
-## Usage
+- `MODEL_NAME_AT_ENDPOINT`, `BASE_KEY`, and `BASE_URL` are required for the LLM backend.
+- `S2_API_KEY` is strongly recommended if you want stable Semantic Scholar access.
+
+## Run
 
 ```bash
-# Activate virtual environment
-source .venv/bin/activate
-
-# Run the agent
-python agent.py
+uv run agent.py
 ```
 
-## Architecture
+## Structure
 
-```
-dr-agent/
-├── agent.py              # Main agent loop with human-in-the-loop interaction
-├── tools.py              # Four function tools exposed to the agent
-├── prompt.py             # System prompts and JSON schema instructions
-└── utils/
-    ├── web_seach_pipeline.py    # Web search, crawling, content extraction
-    ├── paper_search_pipeline.py # Paper discovery, PDF download, metadata
-    ├── convert_to_md.py         # PDF/text to markdown conversion
-    └── helpers.py               # Utility functions
+```text
+dr_agent/
+├── agent.py        # Main interactive loop
+├── models.py       # SearchObjective / ResearchPlan
+├── prompt.py       # Agent prompts
+└── tools/          # Active tool implementations
 ```
 
-### Tools
+## Tools
 
-| Tool | Description |
-|------|-------------|
-| `web_search` | Web search via DuckDuckGo with content extraction |
-| `paper_search` | Academic paper search via DDG/Semantic Scholar |
-| `local_docs_lookup` | Local file reading and markdown conversion |
-| `summarize_sources` | Structured JSON summary generation |
-
-### Data Models
-
-The codebase uses Pydantic models for structured data:
-
-- `WebDocument` / `WebSearchResult` - Web search outputs
-- `PaperDocument` / `PaperSearchResult` - Paper search outputs
-- `WebTemplate` / `PaperTemplate` - Structured summaries with overview, main points, evidence, limitations
-- `SummarizedSource` - Unified wrapper for both source types
-
-## Key Dependencies
-
-- `agents` - OpenAI Agents SDK for agent orchestration
-- `litellm` - LLM gateway (using hosted_vllm provider)
-- `crawl4ai` - Async web crawler
-- `trafilatura` / `readability-lxml` - Content extraction
-- `ddgs` - DuckDuckGo search
-- `marker` - PDF to markdown conversion
-- `httpx` - Async HTTP client
-- `weave` - Observability/tracing
-
-## Requirements
-
-- Python >= 3.11
-- vLLM endpoint with Qwen3-8B (or compatible model)
-
+- `web_search`: Tavily candidate search.
+- `fetch_webpage`: Fetch one webpage and extract readable content.
+- `paper_search`: Mode-aware academic search with fallback across sources.
+- `local_docs_lookup`: Local file and directory lookup.
