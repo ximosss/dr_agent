@@ -2,6 +2,8 @@
 
 A small deep-research agent built on the OpenAI Agents SDK. It asks the model to clarify intent, create a search plan, execute web/paper/local lookups, and synthesize a final answer.
 
+![workflow](./imgs/dr_agent.png)
+
 
 ## Installation
 
