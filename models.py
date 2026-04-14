@@ -27,15 +27,23 @@ class ResearchPlan:
     user_question: str
     research_type: str  # "short-form" | "long-form"
     local_context_summary: Optional[str] = None
+    local_file_path: Optional[str] = None
     objectives: list[SearchObjective] = field(default_factory=list)
     collected_sources: list[dict] = field(default_factory=list)
 
     def to_context_string(self) -> str:
-        """Convert plan to string for agent context."""
+        """Convert plan to string for agent context.
+
+        Completed objectives include their full result_summary so that
+        subsequent objectives can build on earlier findings (context
+        offloading rather than context isolation).
+        """
         lines = [
             f"Research Question: {self.user_question}",
             f"Type: {self.research_type}",
         ]
+        if self.local_file_path:
+            lines.append(f"Local file path: {self.local_file_path}")
         if self.local_context_summary:
             lines.append(f"Local Context: {self.local_context_summary[:500]}...")
 
@@ -44,7 +52,7 @@ class ResearchPlan:
             status_icon = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}[obj.status]
             lines.append(f"  {status_icon} #{obj.objective_id} [{obj.priority}] {obj.description}")
             if obj.result_summary:
-                lines.append(f"      Result: {obj.result_summary[:200]}...")
+                lines.append(f"      Result: {obj.result_summary}")
 
         return "\n".join(lines)
 

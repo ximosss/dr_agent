@@ -7,9 +7,13 @@ from pathlib import Path
 from typing import Optional
 import os
 import re
+import unicodedata
 
 from datasets import concatenate_datasets, get_dataset_config_names, load_dataset
 from huggingface_hub import snapshot_download
+import evaluate
+
+_exact_match = evaluate.load("exact_match")
 
 
 @dataclass
@@ -22,7 +26,12 @@ class EvalExample:
     level: Optional[str] = None
 
 
+# ---------------------------------------------------------------------------
+# Answer extraction & normalisation
+# ---------------------------------------------------------------------------
+
 def extract_final_answer(text: str) -> str:
+    """Pull the text after 'FINAL ANSWER:' if present."""
     if not text:
         return ""
     match = re.search(r"final answer\s*:\s*(.+)", text, flags=re.IGNORECASE | re.DOTALL)
@@ -32,29 +41,65 @@ def extract_final_answer(text: str) -> str:
 
 
 def normalize_answer(text: str) -> str:
+    """Lowercase, strip punctuation / articles / whitespace for comparison."""
     if text is None:
         return ""
-    text = extract_final_answer(text)
+    text = unicodedata.normalize("NFKD", text)
     text = text.replace("\n", " ")
     text = re.sub(r"\s+", " ", text).strip().lower()
+    # strip common prefixes / titles that inflate the answer
+    text = re.sub(r"^(dr|prof|mr|mrs|ms|sir)\.?\s+", "", text)
+    # strip punctuation (keep digits and letters)
     text = re.sub(r"[^\w\s]", "", text)
+    # strip articles
+    text = re.sub(r"\b(a|an|the)\b", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
+def _is_numeric(s: str) -> bool:
+    try:
+        float(s.replace(",", ""))
+        return True
+    except ValueError:
+        return False
+
+
 def score_prediction(prediction: str, gold: Optional[str]) -> Optional[bool]:
+    """Score a single prediction against a gold answer.
+
+    Uses HF ``exact_match`` after normalisation.  Falls back to containment
+    only for non-numeric answers to avoid "3" matching "37".
+    """
     if gold is None:
         return None
+
     pred_norm = normalize_answer(prediction)
     gold_norm = normalize_answer(gold)
+
     if not pred_norm or not gold_norm:
         return False
-    if pred_norm == gold_norm:
+
+    # 1. exact match (via HF evaluate)
+    em = _exact_match.compute(predictions=[pred_norm], references=[gold_norm])
+    if em["exact_match"] == 1.0:
         return True
-    if pred_norm in gold_norm or gold_norm in pred_norm:
-        return True
+
+    # 2. containment — only for non-numeric answers to avoid false positives
+    if not _is_numeric(gold_norm):
+        if gold_norm in pred_norm or pred_norm in gold_norm:
+            return True
+
     return False
 
+
+# ---------------------------------------------------------------------------
+# Benchmark loaders
+# ---------------------------------------------------------------------------
 
 def load_simpleqa() -> list[EvalExample]:
     dataset = load_dataset("OpenEvals/SimpleQA", split="test")
@@ -93,7 +138,7 @@ def _select_gaia_configs(repo_id: str, data_dir: str) -> list[str]:
 
     token = os.getenv("HF_TOKEN")
     configs = get_dataset_config_names(repo_id, token=token)
-    
+
     if not configs:
         data_root = Path(data_dir)
         for candidate in ["2023", "2023_level1", "2023_level2", "2023_level3"]:
@@ -112,7 +157,10 @@ def _select_gaia_configs(repo_id: str, data_dir: str) -> list[str]:
 
 def _load_gaia_split(data_dir: str, config: str):
     for split in ["validation", "dev", "test"]:
-        return load_dataset(data_dir, config, split=split)
+        try:
+            return load_dataset(data_dir, config, split=split)
+        except (ValueError, KeyError):
+            continue
     raise RuntimeError(f"No usable split found for GAIA config {config}.")
 
 

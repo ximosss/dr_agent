@@ -14,7 +14,7 @@ from agents.extensions.models.litellm_model import LitellmModel
 import weave
 
 from models import ResearchPlan, SearchObjective
-from tools import fetch_webpage, local_docs_lookup, paper_search, web_search, run_local_docs_lookup
+from tools import clear_fetch_cache, fetch_webpage, local_docs_lookup, paper_search, web_search, run_local_docs_lookup
 from prompt import (
     SYSTEM_PROMPT,
     INTENT_CLARIFICATION_PROMPT,
@@ -28,10 +28,13 @@ from prompt import (
 
 from evals import extract_final_answer, load_benchmark, score_prediction
 
-# Agent flow Tracking
+# Agent flow tracking
+
 set_tracing_disabled(disabled=True)
 weave.init(os.getenv("WANDB_PROJECT"))
 
+
+OBJECTIVE_RESULT_MAX_CHARS = 2000
 
 # Helper functions
 
@@ -69,6 +72,8 @@ async def get_local_context(local_files_path: str, question: str) -> Optional[st
     return result if result else None
 
 
+# Agent loops
+
 async def clarify_intent(
     question: str,
     local_context: Optional[str] = None,
@@ -100,16 +105,54 @@ async def clarify_intent(
     }
 
 
-async def create_search_plan(clarified_intent: dict, eval_mode: bool = False) -> ResearchPlan:
+def _parse_objectives_json(text: str) -> list[dict]:
+    """Best-effort JSON array extraction from LLM output."""
+    # Strip think blocks, markdown fences
+    text = strip_think_block(text)
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    text = text.strip().rstrip("`")
+
+    # Find the outermost JSON array
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+    return []
+
+
+def _make_default_objectives(question: str) -> list[SearchObjective]:
+    """Fallback objectives when plan parsing fails."""
+    keywords = [w for w in question.split() if len(w) > 3][:5]
+    return [
+        SearchObjective(
+            objective_id=1,
+            description=f"Search the web for: {question[:120]}",
+            search_type="web",
+            priority="high",
+            keywords=keywords or ["search"],
+        ),
+    ]
+
+
+async def create_search_plan(
+    clarified_intent: dict,
+    eval_mode: bool = False,
+    local_file_path: Optional[str] = None,
+) -> ResearchPlan:
     """
     Phase 2: Create detailed search plan based on clarified intent.
     Returns a ResearchPlan with objectives.
+
+    Uses plain text output + manual JSON parsing (instead of output_type)
+    because vLLM endpoints may not support structured-output JSON schema.
     """
     planning_agent = Agent(
         name="ResearchPlanner",
         instructions=EVAL_PLANNING_PROMPT if eval_mode else PLANNING_PROMPT,
         model=create_model(),
-        output_type=list[SearchObjective],
     )
 
     message = f"""
@@ -125,47 +168,37 @@ Local Context Available: {'Yes' if clarified_intent.get('local_context') else 'N
 Output a JSON array of search objectives.
 """
 
-    result = await Runner.run(planning_agent, message)
-    planned_objectives = result.final_output
-
     plan = ResearchPlan(
         user_question=clarified_intent['question'],
         research_type="long-form" if "report" in clarified_intent['clarified_intent'].lower() else "short-form",
         local_context_summary=clarified_intent.get('local_context'),
+        local_file_path=local_file_path,
     )
 
-    for objective in planned_objectives:
-        plan.objectives.append(
-            SearchObjective(
-                objective_id=objective.objective_id,
-                description=objective.description,
-                search_type=objective.search_type,
-                mode=objective.mode,
-                priority=objective.priority,
-                status="pending",
-                keywords=objective.keywords,
-            )
-        )
+    try:
+        result = await Runner.run(planning_agent, message)
+        raw = strip_think_block(result.final_output)
+        items = _parse_objectives_json(raw)
+    except Exception as exc:
+        print(f"[Warning] Planning agent failed ({exc}), using default objectives.")
+        items = []
 
-    # If no objectives parsed, create default ones
-    if not plan.objectives:
-        plan.objectives = [
-            SearchObjective(
-                objective_id=1,
-                description="Search web for general information",
-                search_type="web",
-                priority="high",
-                keywords=[clarified_intent['question']],
-            ),
-            SearchObjective(
-                objective_id=2,
-                description="Search academic papers for authoritative sources",
-                search_type="paper",
-                mode="broad",
-                priority="medium",
-                keywords=[clarified_intent['question']],
-            ),
-        ]
+    if items:
+        for obj in items:
+            plan.objectives.append(
+                SearchObjective(
+                    objective_id=obj.get("objective_id", len(plan.objectives) + 1),
+                    description=obj.get("description", ""),
+                    search_type=obj.get("search_type", "web"),
+                    mode=obj.get("mode"),
+                    priority=obj.get("priority", "high"),
+                    status="pending",
+                    keywords=obj.get("keywords", []),
+                )
+            )
+    else:
+        print("[Warning] Could not parse objectives from LLM output, using defaults.")
+        plan.objectives = _make_default_objectives(clarified_intent["question"])
 
     return plan
 
@@ -177,7 +210,9 @@ async def execute_search_plan(
 ) -> ResearchPlan:
     """
     Phase 3: Agent loop - Execute search plan with context offloading.
-    Main agent executes objectives, updates plan after each tool call.
+
+    Each objective receives the full plan context (including summaries from
+    previously completed objectives) so the agent can build on earlier findings.
     """
     main_agent = Agent(
         name="DeepResearchAgent",
@@ -196,9 +231,9 @@ async def execute_search_plan(
         print(f"\n[Executing] Objective #{current_objective.objective_id}: {current_objective.description}")
         print(f"  Search type: {current_objective.search_type}, Keywords: {current_objective.keywords}")
 
-        # Build task message for this objective
+        # Build task message with full plan context (context offloading)
         task_message = f"""
-Current Research Plan:
+Current Research Plan (including results from completed objectives):
 {plan.to_context_string()}
 
 Your current task is Objective #{current_objective.objective_id}:
@@ -206,16 +241,28 @@ Your current task is Objective #{current_objective.objective_id}:
 - Search type: {current_objective.search_type}
 - Mode: {current_objective.mode or 'N/A'}
 - Suggested keywords: {', '.join(current_objective.keywords)}
-
-Execute this search objective using the appropriate tool. After getting results,
-provide a brief summary of what you found that's relevant to the research question.
 """
 
-        result = await Runner.run(main_agent, task_message, max_turns=30)
+        # Inject local file path so the agent can use local_docs_lookup correctly
+        if plan.local_file_path:
+            task_message += f"""
+A local file is available for this research task.
+When using the local_docs_lookup tool, use this exact path: {plan.local_file_path}
+"""
+
+        task_message += """
+Execute this search objective using the appropriate tool.
+Report ONLY the raw facts you found (exact names, numbers, dates, quotes from sources).
+Do NOT compute a final answer or draw conclusions — a separate agent will do that.
+Build on findings from previously completed objectives if relevant.
+"""
+
+        result = await Runner.run(main_agent, task_message, max_turns=10)
         output = strip_think_block(result.final_output)
 
-        # Update plan with results
-        plan.mark_completed(current_objective.objective_id, output[:500])
+        # Store result with generous budget for context offloading
+        result_summary = output[:OBJECTIVE_RESULT_MAX_CHARS]
+        plan.mark_completed(current_objective.objective_id, result_summary)
         plan.collected_sources.append({
             "objective_id": current_objective.objective_id,
             "summary": output,
@@ -331,7 +378,11 @@ async def run_autonomous_research(
             print(f"  Local context loaded ({len(local_context)} chars)")
 
     clarified_intent = await clarify_intent(question, local_context, eval_mode=eval_mode)
-    plan = await create_search_plan(clarified_intent, eval_mode=eval_mode)
+    plan = await create_search_plan(
+        clarified_intent,
+        eval_mode=eval_mode,
+        local_file_path=local_files_path,
+    )
 
     plan = await execute_search_plan(plan, allow_human=False, eval_mode=eval_mode)
 
@@ -342,7 +393,7 @@ async def run_autonomous_research(
 
     return final_output, plan
 
-
+# --eval
 async def run_eval(benchmark: str, num_examples: Optional[int]) -> None:
     outputs_dir = Path("eval_outputs")
     outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -366,6 +417,7 @@ async def run_eval(benchmark: str, num_examples: Optional[int]) -> None:
             if num_examples and idx >= num_examples:
                 break
             total += 1
+            clear_fetch_cache()
             print(f"\n[Eval] Example {idx + 1}/{num_examples or len(examples)}: {example.example_id}")
             try:
                 prediction_raw, _ = await run_autonomous_research(

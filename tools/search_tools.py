@@ -41,10 +41,5 @@ def run_web_search(query: str, max_results: int = 10) -> str:
 
 
 @function_tool(description_override=WEB_SEARCH_TOOL_PROMPT)
-def web_search(
-    query: str,
-    n_urls: int = 10,
-    max_chars_per_doc: int = 5000,
-) -> str:
-    del max_chars_per_doc
-    return run_web_search(query=query, max_results=n_urls)
+def web_search(query: str, max_results: int = 10) -> str:
+    return run_web_search(query=query, max_results=max_results)

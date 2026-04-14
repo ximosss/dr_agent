@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from typing import Optional
 
 from agents import function_tool
 import pymupdf4llm
@@ -103,10 +104,8 @@ def run_local_docs_lookup(
     local_files_path: str,
     question: str,
     max_chars: int = 12000,
-    summary_prompt: str = "",
 ) -> str:
     """Backward-compatible local context lookup for the current agent flow."""
-    del summary_prompt
 
     path = Path(local_files_path).expanduser().resolve()
     if not path.exists():
@@ -130,13 +129,12 @@ def local_docs_lookup(
     local_files_path: str,
     question: str,
     max_chars: int = 12000,
-    summary_prompt: str = "",
 ) -> str:
+    """Look up local files. The file path is provided in your task context."""
     return run_local_docs_lookup(
         local_files_path=local_files_path,
         question=question,
         max_chars=max_chars,
-        summary_prompt=summary_prompt,
     )
 
 def _extract_matches(content: str, term: str, source: str, results: list[str]) -> None:
