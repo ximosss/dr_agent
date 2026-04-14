@@ -68,4 +68,3 @@ class ResearchPlan:
     def all_completed(self) -> bool:
         """Check if all objectives are completed."""
         return all(o.status == "completed" for o in self.objectives)
-

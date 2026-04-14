@@ -9,6 +9,8 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+# Others
 notebooks/
 logs/
 results/

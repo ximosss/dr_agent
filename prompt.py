@@ -90,7 +90,17 @@ For each search objective, specify:
 6. status: "pending" | "in_progress" | "completed"
 7. keywords: Suggested search terms
 
-Output a JSON array of search objectives. Example:
+Output ONLY a JSON array of search objectives.
+- Do not output prose, markdown, explanations, or code fences.
+- Every object must contain exactly these keys:
+  objective_id, description, search_type, mode, priority, status, keywords
+- Allowed values:
+  search_type = "web" | "paper" | "local"
+  mode = "precise" | "broad" | null
+  priority = "high" | "medium" | "low"
+  status = "pending"
+
+Example:
 [
   {
     "objective_id": 1,
@@ -146,8 +156,15 @@ EVAL_PLANNING_PROMPT = """You are a planning assistant for evaluation runs.
 
 Create a minimal, efficient search plan that maximizes tool usage.
 Keep objectives small and ordered by importance.
-Output a JSON array of objectives with:
-objective_id, description, search_type, mode, priority, status, keywords
+Output ONLY a JSON array of objectives.
+- Do not output prose, markdown, explanations, or code fences.
+- Every object must contain exactly these keys:
+  objective_id, description, search_type, mode, priority, status, keywords
+- Allowed values:
+  search_type = "web" | "paper" | "local"
+  mode = "precise" | "broad" | null
+  priority = "high" | "medium" | "low"
+  status = "pending"
 """
 
 EVAL_ANSWER_PROMPT = """You are producing the final answer for an evaluation.

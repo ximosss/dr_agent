@@ -60,13 +60,13 @@ Non-interactive search:
 uv run run_agent.py --search "your question"
 ```
 
-Benchmark evaluation:
+Benchmark evaluation(SimpleQA, GAIA, Frames):
 
 ```bash
 uv run run_agent.py --eval -b simpleqa -n 50
 ```
 
-Search/interact reports are written to `results/`, evaluation outputs to `eval_outputs/`, and logs to `logs/`.
+Search/interact reports are written to `results/` as Markdown and are not printed to the terminal. Evaluation outputs go to `eval_outputs/`, and logs to `logs/`.
 
 ## Structure
 

@@ -14,7 +14,7 @@ from agents.extensions.models.litellm_model import LitellmModel
 import weave
 
 from models import ResearchPlan, SearchObjective
-from tools import fetch_webpage, local_docs_lookup, paper_search, web_search
+from tools import fetch_webpage, local_docs_lookup, paper_search, web_search, run_local_docs_lookup
 from prompt import (
     SYSTEM_PROMPT,
     INTENT_CLARIFICATION_PROMPT,
@@ -30,8 +30,10 @@ from evals import extract_final_answer, load_benchmark, score_prediction
 
 # Agent flow Tracking
 set_tracing_disabled(disabled=True)
-weave.init(os.getenv("WEAVE_PROJECT"))
+weave.init(os.getenv("WANDB_PROJECT"))
 
+
+# Helper functions
 
 def create_model():
     """Create the LiteLLM model for agents."""
@@ -59,8 +61,6 @@ async def get_local_context(local_files_path: str, question: str) -> Optional[st
     """Use local_docs_lookup tool to get context from local files."""
     if not local_files_path:
         return None
-
-    from tools import run_local_docs_lookup
 
     result = run_local_docs_lookup(
         local_files_path=local_files_path,
@@ -109,6 +109,7 @@ async def create_search_plan(clarified_intent: dict, eval_mode: bool = False) ->
         name="ResearchPlanner",
         instructions=EVAL_PLANNING_PROMPT if eval_mode else PLANNING_PROMPT,
         model=create_model(),
+        output_type=list[SearchObjective],
     )
 
     message = f"""
@@ -125,17 +126,7 @@ Output a JSON array of search objectives.
 """
 
     result = await Runner.run(planning_agent, message)
-    output = strip_think_block(result.final_output)
-
-    try:
-        json_start = output.find('[')
-        json_end = output.rfind(']') + 1
-        if json_start != -1 and json_end > json_start:
-            objectives_json = json.loads(output[json_start:json_end])
-        else:
-            objectives_json = []
-    except json.JSONDecodeError:
-        objectives_json = []
+    planned_objectives = result.final_output
 
     plan = ResearchPlan(
         user_question=clarified_intent['question'],
@@ -143,16 +134,18 @@ Output a JSON array of search objectives.
         local_context_summary=clarified_intent.get('local_context'),
     )
 
-    for obj_data in objectives_json:
-        plan.objectives.append(SearchObjective(
-            objective_id=obj_data.get('objective_id', len(plan.objectives) + 1),
-            description=obj_data.get('description', ''),
-            search_type=obj_data.get('search_type', 'web'),
-            mode=obj_data.get('mode'),
-            priority=obj_data.get('priority', 'medium'),
-            status='pending',
-            keywords=obj_data.get('keywords', []),
-        ))
+    for objective in planned_objectives:
+        plan.objectives.append(
+            SearchObjective(
+                objective_id=objective.objective_id,
+                description=objective.description,
+                search_type=objective.search_type,
+                mode=objective.mode,
+                priority=objective.priority,
+                status="pending",
+                keywords=objective.keywords,
+            )
+        )
 
     # If no objectives parsed, create default ones
     if not plan.objectives:
