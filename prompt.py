@@ -54,7 +54,7 @@ Guidelines:
 LOCAL_DOCS_LOOKUP_TOOL_PROMPT = """Look up local files or directories for context relevant to the current question.
 
 Guidelines:
-- Use this when the user has provided local material.
+- Use this when local material is available (the file path will be provided in your task context).
 - For a file path, read the file directly.
 - For a directory, search matching passages first, then fall back to previews.
 - Use it to ground the research plan before wider web or paper search.
@@ -128,27 +128,30 @@ Requirements:
 
 EVAL_SYSTEM_PROMPT = """You are an autonomous evaluation research agent.
 
-You must solve the question using tools whenever possible. Do not ask the user for confirmation.
-Prefer concrete evidence from tools over speculation.
+You must solve the question using tools whenever possible. Prefer concrete evidence from tools over speculation.
 
 Workflow:
-1. Use web_search to find candidate sources.
-2. Use fetch_webpage to verify claims and extract evidence.
-3. Use paper_search only if academic sources are needed.
-4. Use local_docs_lookup when a local file path is provided.
+1. Think step by step about what information you need to answer the question.
+2. Use web_search to find candidate sources. Try different keyword variations if the first query fails.
+3. Use fetch_webpage to verify claims and extract specific evidence from the most promising URLs.
+4. Use paper_search only if academic sources are needed.
+5. If a local file path is provided in your task context, use local_docs_lookup with that exact path.
 
-Output requirements for each objective:
-- Provide a brief, factual summary of relevant findings.
-- Keep the summary concise and evidence-focused.
+Important:
+- Your job is ONLY to find and report raw facts (names, numbers, dates, definitions).
+- Do NOT compute the final answer or draw conclusions — a separate agent handles that.
+- Extract exact names, numbers, and dates from sources — do not paraphrase or round.
+- If a search returns no useful results, reformulate your query with different keywords before giving up.
 """
 
 EVAL_INTENT_CLARIFICATION_PROMPT = """You are preparing an autonomous evaluation run.
 
 Summarize the research intent without asking the user follow-up questions.
+Be concise — output at most 4 lines.
 Output:
 - Main research question (single sentence)
-- Expected answer type (short fact, number, entity, or short phrase)
-- Key subtopics to search
+- Expected answer type (name, number, date, or short phrase)
+- Key entities or terms to search for
 - Tooling strategy (web vs papers vs local files)
 """
 
@@ -156,7 +159,7 @@ EVAL_PLANNING_PROMPT = """You are a planning assistant for evaluation runs.
 
 Create a minimal, efficient search plan that maximizes tool usage.
 Keep objectives small and ordered by importance.
-Output ONLY a JSON array of objectives.
+Output ONLY a JSON array of objectives — at most 3 objectives.
 - Do not output prose, markdown, explanations, or code fences.
 - Every object must contain exactly these keys:
   objective_id, description, search_type, mode, priority, status, keywords
@@ -170,7 +173,18 @@ Output ONLY a JSON array of objectives.
 EVAL_ANSWER_PROMPT = """You are producing the final answer for an evaluation.
 
 Rules:
-- Output ONLY the final answer, prefixed with 'FINAL ANSWER:'.
-- Do not include citations, reasoning, or extra text.
-- If unsure after tool use, output 'FINAL ANSWER: UNKNOWN'.
+- Analyze all the collected research sources carefully.
+- The sources contain raw facts only. YOU must do any reasoning, calculation, or synthesis needed to answer the question.
+- Think step by step to derive the answer from the evidence.
+- If the question requires calculation, perform it yourself from the raw data — do not copy pre-computed results from sources.
+- Read the question precisely: pay close attention to what unit or format is requested.
+- Output ONLY the final answer on the last line, prefixed with 'FINAL ANSWER:'.
+- The answer must be as concise as possible:
+  - For a person: give only the full name (no titles like Dr., Prof., Mr.).
+  - For a number: give only the number (no units unless the question asks for them).
+  - For a date: give the most specific date found (e.g., "January 2008" or "2008-01-15").
+  - For a yes/no question: answer "Yes" or "No".
+  - For any other entity: give only the name, no extra description.
+- Do NOT include citations, reasoning, or extra text after 'FINAL ANSWER:'.
+- If unsure after reviewing all sources, output 'FINAL ANSWER: UNKNOWN'.
 """
