@@ -27,6 +27,7 @@ from prompt import (
 )
 
 from evals import extract_final_answer, load_benchmark, score_prediction
+from training.benchmark_splits import filter_examples_by_partition
 
 # Agent flow tracking
 
@@ -401,14 +402,18 @@ async def run_eval(benchmark: str, num_examples: Optional[int]) -> None:
     per_example_path = outputs_dir / f"{benchmark}_{timestamp}.jsonl"
     summary_path = outputs_dir / f"{benchmark}_{timestamp}_results.json"
 
-    examples = load_benchmark(benchmark)
+    examples = filter_examples_by_partition(
+        benchmark,
+        load_benchmark(benchmark),
+        partition="test",
+    )
 
     total = 0
     scored = 0
     correct = 0
     errors = 0
 
-    print(f"[Eval] Loaded {len(examples)} examples for benchmark '{benchmark}'.")
+    print(f"[Eval] Loaded {len(examples)} examples from the reserved test split for benchmark '{benchmark}'.")
     if num_examples:
         print(f"[Eval] Limiting to first {num_examples} examples.")
 
@@ -465,6 +470,7 @@ async def run_eval(benchmark: str, num_examples: Optional[int]) -> None:
     accuracy = (correct / scored) if scored else None
     summary = {
         "benchmark": benchmark,
+        "partition": "test",
         "timestamp": timestamp,
         "total_examples": total,
         "scored_examples": scored,

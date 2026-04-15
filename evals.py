@@ -137,7 +137,10 @@ def load_frames() -> list[EvalExample]:
 def _select_gaia_configs(repo_id: str, data_dir: str) -> list[str]:
 
     token = os.getenv("HF_TOKEN")
-    configs = get_dataset_config_names(repo_id, token=token)
+    try:
+        configs = get_dataset_config_names(repo_id, token=token)
+    except Exception:
+        configs = []
 
     if not configs:
         data_root = Path(data_dir)

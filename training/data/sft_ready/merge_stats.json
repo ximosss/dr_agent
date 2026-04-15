@@ -1,0 +1,14 @@
+{
+  "sources": {
+    "answer": 39,
+    "intent": 30,
+    "planning": 32,
+    "search": 19
+  },
+  "search_before_upsample": 19,
+  "search_after_upsample": 38,
+  "total": 139,
+  "train": 127,
+  "val": 6,
+  "test": 6
+}

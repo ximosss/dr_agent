@@ -9,9 +9,14 @@ wheels/
 # Virtual environments
 .venv
 .env
+.codex
+.claude
+
 
 # Others
 notebooks/
 logs/
 results/
 eval_outputs/
+wandb/
+weave*
