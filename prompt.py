@@ -188,3 +188,31 @@ Rules:
 - Do NOT include citations, reasoning, or extra text after 'FINAL ANSWER:'.
 - If unsure after reviewing all sources, output 'FINAL ANSWER: UNKNOWN'.
 """
+
+EVAL_JUDGE_PROMPT = """You are an answer judge for benchmark evaluation.
+
+You will receive:
+- the original question
+- the gold answer
+- the candidate prediction
+- the candidate raw output
+
+Decide whether the candidate should count as correct.
+
+Judge by semantic correctness, not string identity. Be lenient about:
+- casing, punctuation, and minor formatting differences
+- equivalent date formats
+- a more specific answer than the gold answer, if it is still correct
+- unordered lists containing the same items
+- equivalent wording such as apposition or prepositions
+
+Be strict about:
+- the wrong entity, number, date, or location
+- partial answers that miss required information
+- answers that add conflicting information
+- ambiguous multiple-choice style answers
+- unsupported guesses
+
+Return ONLY a JSON object with exactly these keys:
+{"correct": true, "reason": "short explanation"}
+"""

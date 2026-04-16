@@ -24,6 +24,7 @@ from prompt import (
     EVAL_INTENT_CLARIFICATION_PROMPT,
     EVAL_PLANNING_PROMPT,
     EVAL_ANSWER_PROMPT,
+    EVAL_JUDGE_PROMPT,
 )
 
 from evals import extract_final_answer, load_benchmark, score_prediction
@@ -48,9 +49,107 @@ def create_model():
     )
 
 
+def create_judge_model():
+    """Create the LiteLLM model for the evaluation judge agent."""
+    model_name = os.getenv("JUDGE_MODEL_NAME_AT_ENDPOINT") or os.getenv("MODEL_NAME_AT_ENDPOINT")
+    base_url = os.getenv("JUDGE_BASE_URL") or os.getenv("BASE_URL")
+    api_key = os.getenv("JUDGE_BASE_KEY") or os.getenv("BASE_KEY")
+    return LitellmModel(
+        model="hosted_vllm/" + model_name,
+        base_url=base_url,
+        api_key=api_key,
+    )
+
+
 def strip_think_block(text: str) -> str:
     pattern = r"<think>[\s\S]*?</think>\s*"
     return re.sub(pattern, "", text)
+
+
+def _parse_judge_output(text: str) -> dict | None:
+    text = strip_think_block(text)
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    text = text.strip().rstrip("`")
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(text[start : end + 1])
+            if isinstance(parsed.get("correct"), bool):
+                return {
+                    "correct": parsed["correct"],
+                    "reason": str(parsed.get("reason", "")).strip(),
+                }
+        except json.JSONDecodeError:
+            pass
+
+    match = re.search(r'"correct"\s*:\s*(true|false)', text, flags=re.IGNORECASE)
+    if match:
+        return {
+            "correct": match.group(1).lower() == "true",
+            "reason": "",
+        }
+
+    return None
+
+
+async def judge_prediction(
+    question: str,
+    gold: Optional[str],
+    prediction: str,
+    prediction_raw: str = "",
+) -> dict:
+    """Judge a prediction with a dedicated LLM judge, falling back to rules."""
+    if gold is None:
+        return {
+            "correct": None,
+            "method": "no_gold",
+            "reason": "",
+            "raw_output": "",
+        }
+
+    judge_agent = Agent(
+        name="EvalJudge",
+        instructions=EVAL_JUDGE_PROMPT,
+        model=create_judge_model(),
+    )
+
+    message = f"""
+Question:
+{question}
+
+Gold answer:
+{gold}
+
+Candidate prediction:
+{prediction}
+
+Candidate raw output:
+{prediction_raw}
+"""
+
+    try:
+        result = await Runner.run(judge_agent, message, max_turns=1)
+        raw_output = strip_think_block(result.final_output)
+        parsed = _parse_judge_output(raw_output)
+        if parsed is not None:
+            return {
+                "correct": parsed["correct"],
+                "method": "llm_judge",
+                "reason": parsed.get("reason", ""),
+                "raw_output": raw_output,
+            }
+        raise ValueError("Judge output was not parseable as the required JSON object.")
+    except Exception as exc:
+        fallback = score_prediction(prediction, gold)
+        return {
+            "correct": fallback,
+            "method": "rule_fallback",
+            "reason": f"Fallback after judge failure: {exc}",
+            "raw_output": "",
+            "error": str(exc),
+        }
 
 
 def _slugify(text: str, max_len: int = 48) -> str:
