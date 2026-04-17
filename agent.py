@@ -94,64 +94,6 @@ def _parse_judge_output(text: str) -> dict | None:
     return None
 
 
-async def judge_prediction(
-    question: str,
-    gold: Optional[str],
-    prediction: str,
-    prediction_raw: str = "",
-) -> dict:
-    """Judge a prediction with a dedicated LLM judge, falling back to rules."""
-    if gold is None:
-        return {
-            "correct": None,
-            "method": "no_gold",
-            "reason": "",
-            "raw_output": "",
-        }
-
-    judge_agent = Agent(
-        name="EvalJudge",
-        instructions=EVAL_JUDGE_PROMPT,
-        model=create_judge_model(),
-    )
-
-    message = f"""
-Question:
-{question}
-
-Gold answer:
-{gold}
-
-Candidate prediction:
-{prediction}
-
-Candidate raw output:
-{prediction_raw}
-"""
-
-    try:
-        result = await Runner.run(judge_agent, message, max_turns=1)
-        raw_output = strip_think_block(result.final_output)
-        parsed = _parse_judge_output(raw_output)
-        if parsed is not None:
-            return {
-                "correct": parsed["correct"],
-                "method": "llm_judge",
-                "reason": parsed.get("reason", ""),
-                "raw_output": raw_output,
-            }
-        raise ValueError("Judge output was not parseable as the required JSON object.")
-    except Exception as exc:
-        fallback = score_prediction(prediction, gold)
-        return {
-            "correct": fallback,
-            "method": "rule_fallback",
-            "reason": f"Fallback after judge failure: {exc}",
-            "raw_output": "",
-            "error": str(exc),
-        }
-
-
 def _slugify(text: str, max_len: int = 48) -> str:
     cleaned = re.sub(r"[^\w\s-]", "", text.lower())
     cleaned = re.sub(r"\s+", "_", cleaned).strip("_")
@@ -223,20 +165,6 @@ def _parse_objectives_json(text: str) -> list[dict]:
     return []
 
 
-def _make_default_objectives(question: str) -> list[SearchObjective]:
-    """Fallback objectives when plan parsing fails."""
-    keywords = [w for w in question.split() if len(w) > 3][:5]
-    return [
-        SearchObjective(
-            objective_id=1,
-            description=f"Search the web for: {question[:120]}",
-            search_type="web",
-            priority="high",
-            keywords=keywords or ["search"],
-        ),
-    ]
-
-
 async def create_search_plan(
     clarified_intent: dict,
     eval_mode: bool = False,
@@ -296,9 +224,6 @@ Output a JSON array of search objectives.
                     keywords=obj.get("keywords", []),
                 )
             )
-    else:
-        print("[Warning] Could not parse objectives from LLM output, using defaults.")
-        plan.objectives = _make_default_objectives(clarified_intent["question"])
 
     return plan
 
@@ -466,6 +391,64 @@ Collected Research Sources:
     return strip_think_block(result.final_output)
 
 
+async def judge_prediction(
+    question: str,
+    gold: Optional[str],
+    prediction: str,
+    prediction_raw: str = "",
+) -> dict:
+    """Judge a prediction with a dedicated LLM judge, falling back to rules."""
+    if gold is None:
+        return {
+            "correct": None,
+            "method": "no_gold",
+            "reason": "",
+            "raw_output": "",
+        }
+
+    judge_agent = Agent(
+        name="EvalJudge",
+        instructions=EVAL_JUDGE_PROMPT,
+        model=create_judge_model(),
+    )
+
+    message = f"""
+Question:
+{question}
+
+Gold answer:
+{gold}
+
+Candidate prediction:
+{prediction}
+
+Candidate raw output:
+{prediction_raw}
+"""
+
+    try:
+        result = await Runner.run(judge_agent, message, max_turns=1)
+        raw_output = strip_think_block(result.final_output)
+        parsed = _parse_judge_output(raw_output)
+        if parsed is not None:
+            return {
+                "correct": parsed["correct"],
+                "method": "llm_judge",
+                "reason": parsed.get("reason", ""),
+                "raw_output": raw_output,
+            }
+        raise ValueError("Judge output was not parseable as the required JSON object.")
+    except Exception as exc:
+        fallback = score_prediction(prediction, gold)
+        return {
+            "correct": fallback,
+            "method": "rule_fallback",
+            "reason": f"Fallback after judge failure: {exc}",
+            "raw_output": "",
+            "error": str(exc),
+        }
+
+
 async def run_autonomous_research(
     question: str,
     local_files_path: Optional[str] = None,
@@ -530,7 +513,14 @@ async def run_eval(benchmark: str, num_examples: Optional[int]) -> None:
                     eval_mode=True,
                 )
                 prediction = extract_final_answer(prediction_raw)
-                is_correct = score_prediction(prediction, example.answer)
+                rule_correct = score_prediction(prediction, example.answer)
+                judge = await judge_prediction(
+                    question=example.question,
+                    gold=example.answer,
+                    prediction=prediction,
+                    prediction_raw=prediction_raw,
+                )
+                is_correct = judge["correct"]
                 if is_correct is not None:
                     scored += 1
                     if is_correct:
@@ -544,10 +534,16 @@ async def run_eval(benchmark: str, num_examples: Optional[int]) -> None:
                     "prediction_raw": prediction_raw,
                     "gold": example.answer,
                     "correct": is_correct,
+                    "rule_correct": rule_correct,
+                    "judge_method": judge.get("method"),
+                    "judge_reason": judge.get("reason"),
+                    "judge_raw_output": judge.get("raw_output"),
                     "level": example.level,
                     "file_path": example.file_path,
                     "metadata": example.metadata,
                 }
+                if judge.get("error"):
+                    record["judge_error"] = judge["error"]
             except Exception as exc:
                 errors += 1
                 record = {
