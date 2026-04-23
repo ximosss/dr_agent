@@ -6,6 +6,7 @@ This script:
 2. Filters out questions already present in Weave data
 3. Runs each question through the full agent pipeline using the teacher model
 4. Results are automatically captured by Weave (already initialized in agent.py)
+5. A dedicated judge agent scores semantic correctness for SFT filtering
 
 Prerequisites:
   - Teacher model must be served via vLLM on the configured endpoint
@@ -30,7 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from evals import load_benchmark, extract_final_answer, score_prediction, EvalExample
-from agent import run_autonomous_research
+from agent import run_autonomous_research, judge_prediction
 from training.benchmark_splits import filter_examples_by_partition
 from tools import clear_fetch_cache
 
@@ -105,9 +106,17 @@ async def collect_trajectories(
                     example.question,
                     local_files_path=example.file_path,
                     eval_mode=True,
+                    benchmark_name=benchmark,
                 )
                 prediction = extract_final_answer(prediction_raw)
-                is_correct = score_prediction(prediction, example.answer)
+                rule_correct = score_prediction(prediction, example.answer)
+                judge = await judge_prediction(
+                    question=example.question,
+                    gold=example.answer,
+                    prediction=prediction,
+                    prediction_raw=prediction_raw,
+                )
+                is_correct = judge["correct"]
 
                 if is_correct:
                     correct += 1
@@ -120,12 +129,18 @@ async def collect_trajectories(
                     "prediction_raw": prediction_raw,
                     "gold": example.answer,
                     "correct": is_correct,
+                    "rule_correct": rule_correct,
+                    "judge_method": judge.get("method"),
+                    "judge_reason": judge.get("reason"),
+                    "judge_raw_output": judge.get("raw_output"),
                     "n_objectives": len(plan.objectives) if plan else 0,
                     "collected_sources": [
                         {"objective_id": s["objective_id"], "summary": s["summary"][:500]}
                         for s in (plan.collected_sources if plan else [])
                     ],
                 }
+                if judge.get("error"):
+                    record["judge_error"] = judge["error"]
 
             except Exception as exc:
                 errors += 1

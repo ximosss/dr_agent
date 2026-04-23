@@ -9,9 +9,9 @@ wheels/
 # Virtual environments
 .venv
 .env
+
 .codex
 .claude
-
 
 # Others
 notebooks/
@@ -20,3 +20,4 @@ results/
 eval_outputs/
 wandb/
 weave*
+training/data/

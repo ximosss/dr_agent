@@ -1,8 +1,8 @@
 """
 Step 5: Merge all data sources and create train/val/test splits.
 
-Combines all converted SFT-ready JSON files, applies search trajectory 2x
-upsampling, then creates an explicit train/eval split for LLaMA-Factory.
+Combines all converted SFT-ready JSON files and creates an explicit train/eval
+split for LLaMA-Factory.
 
 Usage:
     python training/merge_and_split.py
@@ -49,12 +49,14 @@ def run_merge(sft_ready_dir: Path, seed: int = 42, eval_ratio: float = 0.05) -> 
 
         print(f"  {source_name}: {len(items)} examples")
 
-    # 2x upsample search trajectories
-    search_upsampled = search_data * 2
+    # Keep search trajectories at their natural frequency. Earlier versions
+    # duplicated search examples when the corpus was small, but that is no
+    # longer appropriate once we import thousands of public trajectories.
+    search_upsampled = search_data
     stats["search_before_upsample"] = len(search_data)
     stats["search_after_upsample"] = len(search_upsampled)
     all_data.extend(search_upsampled)
-    print(f"\nSearch upsampled: {len(search_data)} → {len(search_upsampled)}")
+    print(f"\nSearch kept at natural count: {len(search_data)}")
 
     # Shuffle
     random.seed(seed)

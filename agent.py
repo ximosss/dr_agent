@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import re
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-from agents import Agent, Runner, set_tracing_disabled
+from agents import Agent, ModelSettings, RunHooks, Runner, set_tracing_disabled
 from agents.extensions.models.litellm_model import LitellmModel
 import weave
 
@@ -36,7 +37,112 @@ set_tracing_disabled(disabled=True)
 weave.init(os.getenv("WANDB_PROJECT"))
 
 
-OBJECTIVE_RESULT_MAX_CHARS = 2000
+OBJECTIVE_RESULT_MAX_CHARS = 1400
+COLLECTED_SOURCE_MAX_CHARS = 1200
+FINAL_SOURCE_BUNDLE_MAX_CHARS = 8000
+
+
+@dataclass(frozen=True)
+class ToolBudget:
+    limits: dict[str, int]
+    max_turns: int
+
+
+@dataclass
+class ToolBudgetState:
+    limits: dict[str, int]
+    counts: dict[str, int] = field(default_factory=dict)
+
+    def can_use(self, tool_name: str) -> bool:
+        total_limit = self.limits.get("_total")
+        if total_limit is not None and sum(self.counts.values()) >= total_limit:
+            return False
+
+        tool_limit = self.limits.get(tool_name)
+        if tool_limit is None:
+            return True
+        return self.counts.get(tool_name, 0) < tool_limit
+
+    def record_tool(self, tool_name: str) -> None:
+        self.counts[tool_name] = self.counts.get(tool_name, 0) + 1
+
+    def prompt_lines(self) -> list[str]:
+        order = ("web_search", "fetch_webpage", "paper_search", "local_docs_lookup")
+        lines = []
+        for tool_name in order:
+            limit = self.limits.get(tool_name)
+            if limit is not None:
+                lines.append(f"- {tool_name}: at most {limit} calls")
+        total_limit = self.limits.get("_total")
+        if total_limit is not None:
+            lines.append(f"- total tool calls across this objective: at most {total_limit}")
+        return lines
+
+    def usage_summary(self) -> str:
+        order = ("web_search", "fetch_webpage", "paper_search", "local_docs_lookup")
+        parts = [f"{tool_name}={self.counts.get(tool_name, 0)}" for tool_name in order]
+        parts.append(f"total={sum(self.counts.values())}")
+        return ", ".join(parts)
+
+
+class ToolBudgetHooks(RunHooks[ToolBudgetState]):
+    async def on_tool_end(self, context, agent, tool, result) -> None:
+        if isinstance(context.context, ToolBudgetState):
+            context.context.record_tool(tool.name)
+
+
+INTERACTIVE_TOOL_BUDGET = ToolBudget(
+    limits={
+        "web_search": 6,
+        "fetch_webpage": 8,
+        "paper_search": 4,
+        "local_docs_lookup": 2,
+        "_total": 18,
+    },
+    max_turns=18,
+)
+DEFAULT_EVAL_TOOL_BUDGET = ToolBudget(
+    limits={
+        "web_search": 5,
+        "fetch_webpage": 7,
+        "paper_search": 2,
+        "local_docs_lookup": 1,
+        "_total": 14,
+    },
+    max_turns=16,
+)
+BENCHMARK_EVAL_TOOL_BUDGETS = {
+    "simpleqa": ToolBudget(
+        limits={
+            "web_search": 4,
+            "fetch_webpage": 6,
+            "paper_search": 2,
+            "local_docs_lookup": 1,
+            "_total": 12,
+        },
+        max_turns=14,
+    ),
+    "frames": ToolBudget(
+        limits={
+            "web_search": 5,
+            "fetch_webpage": 7,
+            "paper_search": 2,
+            "local_docs_lookup": 1,
+            "_total": 14,
+        },
+        max_turns=16,
+    ),
+    "gaia": ToolBudget(
+        limits={
+            "web_search": 6,
+            "fetch_webpage": 8,
+            "paper_search": 3,
+            "local_docs_lookup": 1,
+            "_total": 16,
+        },
+        max_turns=18,
+    ),
+}
 
 # Helper functions
 
@@ -100,6 +206,62 @@ def _slugify(text: str, max_len: int = 48) -> str:
     if not cleaned:
         cleaned = "report"
     return cleaned[:max_len].rstrip("_")
+
+
+def _resolve_tool_budget(eval_mode: bool, benchmark_name: Optional[str]) -> ToolBudget:
+    if not eval_mode:
+        return INTERACTIVE_TOOL_BUDGET
+
+    benchmark_key = (benchmark_name or "").strip().lower()
+    return BENCHMARK_EVAL_TOOL_BUDGETS.get(benchmark_key, DEFAULT_EVAL_TOOL_BUDGET)
+
+
+def _tool_enabled_checker(tool_name: str):
+    def is_enabled(run_context, agent) -> bool:
+        state = run_context.context
+        if not isinstance(state, ToolBudgetState):
+            return True
+        return state.can_use(tool_name)
+
+    return is_enabled
+
+
+def _build_budgeted_tools():
+    return [
+        replace(web_search, is_enabled=_tool_enabled_checker("web_search")),
+        replace(fetch_webpage, is_enabled=_tool_enabled_checker("fetch_webpage")),
+        replace(paper_search, is_enabled=_tool_enabled_checker("paper_search")),
+        replace(local_docs_lookup, is_enabled=_tool_enabled_checker("local_docs_lookup")),
+    ]
+
+
+def _truncate_for_context(text: str, max_chars: int) -> str:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 15].rstrip() + "\n...[truncated]"
+
+
+def _compile_sources_text(plan: ResearchPlan) -> str:
+    chunks: list[str] = []
+    used = 0
+    truncated = False
+
+    for source in plan.collected_sources:
+        chunk = f"=== Source from Objective #{source['objective_id']} ===\n{source['summary']}"
+        if used + len(chunk) > FINAL_SOURCE_BUNDLE_MAX_CHARS:
+            remaining = FINAL_SOURCE_BUNDLE_MAX_CHARS - used
+            if remaining > 64:
+                chunks.append(_truncate_for_context(chunk, remaining))
+            truncated = True
+            break
+        chunks.append(chunk)
+        used += len(chunk)
+
+    if truncated:
+        chunks.append("[Additional source content omitted to stay within the context budget.]")
+
+    return "\n\n".join(chunks)
 
 
 async def get_local_context(local_files_path: str, question: str) -> Optional[str]:
@@ -232,6 +394,7 @@ async def execute_search_plan(
     plan: ResearchPlan,
     allow_human: bool = True,
     eval_mode: bool = False,
+    benchmark_name: Optional[str] = None,
 ) -> ResearchPlan:
     """
     Phase 3: Agent loop - Execute search plan with context offloading.
@@ -239,11 +402,16 @@ async def execute_search_plan(
     Each objective receives the full plan context (including summaries from
     previously completed objectives) so the agent can build on earlier findings.
     """
+    budget = _resolve_tool_budget(eval_mode, benchmark_name)
+    budget_hooks = ToolBudgetHooks()
+    budgeted_tools = _build_budgeted_tools()
+
     main_agent = Agent(
         name="DeepResearchAgent",
         instructions=EVAL_SYSTEM_PROMPT if eval_mode else SYSTEM_PROMPT,
         model=create_model(),
-        tools=[web_search, fetch_webpage, paper_search, local_docs_lookup],
+        model_settings=ModelSettings(parallel_tool_calls=False),
+        tools=budgeted_tools,
     )
 
     while not plan.all_completed():
@@ -256,6 +424,8 @@ async def execute_search_plan(
         print(f"\n[Executing] Objective #{current_objective.objective_id}: {current_objective.description}")
         print(f"  Search type: {current_objective.search_type}, Keywords: {current_objective.keywords}")
 
+        budget_state = ToolBudgetState(limits=dict(budget.limits))
+
         # Build task message with full plan context (context offloading)
         task_message = f"""
 Current Research Plan (including results from completed objectives):
@@ -266,6 +436,9 @@ Your current task is Objective #{current_objective.objective_id}:
 - Search type: {current_objective.search_type}
 - Mode: {current_objective.mode or 'N/A'}
 - Suggested keywords: {', '.join(current_objective.keywords)}
+
+Budget for this objective:
+{chr(10).join(budget_state.prompt_lines())}
 """
 
         # Inject local file path so the agent can use local_docs_lookup correctly
@@ -280,20 +453,33 @@ Execute this search objective using the appropriate tool.
 Report ONLY the raw facts you found (exact names, numbers, dates, quotes from sources).
 Do NOT compute a final answer or draw conclusions — a separate agent will do that.
 Build on findings from previously completed objectives if relevant.
+Stop searching as soon as you have enough evidence to answer the current objective.
 """
 
-        result = await Runner.run(main_agent, task_message, max_turns=10)
-        output = strip_think_block(result.final_output)
+        try:
+            result = await Runner.run(
+                main_agent,
+                task_message,
+                context=budget_state,
+                hooks=budget_hooks,
+                max_turns=budget.max_turns,
+            )
+            output = strip_think_block(result.final_output)
+        except Exception as exc:
+            print(f"[Warning] Objective #{current_objective.objective_id} ended early: {exc}")
+            output = f"[OBJECTIVE_ERROR] {exc}"
 
         # Store result with generous budget for context offloading
-        result_summary = output[:OBJECTIVE_RESULT_MAX_CHARS]
+        result_summary = _truncate_for_context(output, OBJECTIVE_RESULT_MAX_CHARS)
         plan.mark_completed(current_objective.objective_id, result_summary)
         plan.collected_sources.append({
             "objective_id": current_objective.objective_id,
-            "summary": output,
+            "summary": _truncate_for_context(output, COLLECTED_SOURCE_MAX_CHARS),
+            "tool_usage": budget_state.usage_summary(),
         })
 
         print(f"[Completed] Objective #{current_objective.objective_id}")
+        print(f"  Tool usage: {budget_state.usage_summary()}")
 
         # User checkpoint: allow intervention
         if allow_human:
@@ -332,10 +518,7 @@ async def generate_final_report(plan: ResearchPlan) -> str:
     )
 
     # Compile all collected sources
-    sources_text = "\n\n".join([
-        f"=== Source from Objective #{s['objective_id']} ===\n{s['summary']}"
-        for s in plan.collected_sources
-    ])
+    sources_text = _compile_sources_text(plan)
 
     message = f"""
 Original Research Question: {plan.user_question}
@@ -375,10 +558,7 @@ async def generate_eval_answer(plan: ResearchPlan, question: str) -> str:
         model=create_model(),
     )
 
-    sources_text = "\n\n".join([
-        f"=== Source from Objective #{s['objective_id']} ===\n{s['summary']}"
-        for s in plan.collected_sources
-    ])
+    sources_text = _compile_sources_text(plan)
 
     message = f"""
 Question: {question}
@@ -453,6 +633,7 @@ async def run_autonomous_research(
     question: str,
     local_files_path: Optional[str] = None,
     eval_mode: bool = False,
+    benchmark_name: Optional[str] = None,
 ) -> tuple[str, ResearchPlan]:
     local_context = None
     if local_files_path:
@@ -467,7 +648,12 @@ async def run_autonomous_research(
         local_file_path=local_files_path,
     )
 
-    plan = await execute_search_plan(plan, allow_human=False, eval_mode=eval_mode)
+    plan = await execute_search_plan(
+        plan,
+        allow_human=False,
+        eval_mode=eval_mode,
+        benchmark_name=benchmark_name,
+    )
 
     if eval_mode:
         final_output = await generate_eval_answer(plan, question)
@@ -511,6 +697,7 @@ async def run_eval(benchmark: str, num_examples: Optional[int]) -> None:
                     example.question,
                     local_files_path=example.file_path,
                     eval_mode=True,
+                    benchmark_name=benchmark,
                 )
                 prediction = extract_final_answer(prediction_raw)
                 rule_correct = score_prediction(prediction, example.answer)

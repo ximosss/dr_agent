@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agents import Agent, Runner
+from agents import Agent, Runner, ModelSettings
 from agents.extensions.models.litellm_model import LitellmModel
 from dotenv import load_dotenv
 
@@ -39,7 +39,13 @@ from prompt import (
     EVAL_ANSWER_PROMPT,
     EVAL_SYSTEM_PROMPT,
 )
-from evals import load_benchmark
+
+
+DEFAULT_AUGMENT_CONCURRENCY = int(os.getenv("AUGMENT_CONCURRENCY", "8"))
+INTENT_MAX_TOKENS = int(os.getenv("AUGMENT_INTENT_MAX_TOKENS", "512"))
+PLAN_MAX_TOKENS = int(os.getenv("AUGMENT_PLAN_MAX_TOKENS", "768"))
+ANSWER_MAX_TOKENS = int(os.getenv("AUGMENT_ANSWER_MAX_TOKENS", "1024"))
+REUSE_MAX_TOKENS = int(os.getenv("AUGMENT_REUSE_MAX_TOKENS", "768"))
 
 
 def create_model():
@@ -56,26 +62,99 @@ def strip_think_block(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Collect diverse questions from benchmarks
+# Collect diverse questions from local training artifacts
 # ---------------------------------------------------------------------------
 
-def collect_questions(num: int) -> list[str]:
-    """Collect diverse questions from all benchmarks."""
+def _extend_unique_questions(target: list[str], seen: set[str], candidates: list[str]) -> None:
+    for candidate in candidates:
+        question = candidate.strip()
+        if not question:
+            continue
+        if question in seen:
+            continue
+        seen.add(question)
+        target.append(question)
+
+
+def _load_questions_from_teacher_dir(teacher_dir: Path) -> list[str]:
     questions = []
-    for bench in ["frames", "simpleqa"]:
-        try:
-            examples = load_benchmark(bench)
-            questions.extend([ex.question for ex in examples])
-        except Exception as e:
-            print(f"Warning: could not load {bench}: {e}")
-    try:
-        examples = load_benchmark("gaia")
-        questions.extend([ex.question for ex in examples if not ex.file_path])
-    except Exception as e:
-        print(f"Warning: could not load gaia: {e}")
+    if not teacher_dir.exists():
+        return questions
+    for jsonl_path in sorted(teacher_dir.glob("*.jsonl")):
+        with jsonl_path.open() as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                question = str(rec.get("question", "")).strip()
+                if question:
+                    questions.append(question)
+    return questions
+
+
+def _load_questions_from_weave_dir(weave_dir: Path) -> list[str]:
+    questions = []
+    for path in [
+        weave_dir / "search_trajectories.jsonl",
+        weave_dir / "intent_examples.jsonl",
+        weave_dir / "planning_examples.jsonl",
+        weave_dir / "answer_examples.jsonl",
+    ]:
+        if not path.exists():
+            continue
+        with path.open() as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if path.name == "search_trajectories.jsonl":
+                    question = str(rec.get("question_key", "")).strip()
+                else:
+                    user_msg = str(rec.get("user", "")).strip()
+                    if user_msg.startswith("User question: "):
+                        question = user_msg.replace("User question: ", "", 1).strip()
+                    else:
+                        question = user_msg
+                if question:
+                    questions.append(question)
+    return questions
+
+
+def collect_questions(num: int, weave_dir: Path, teacher_dir: Path) -> list[str]:
+    """Collect diverse questions from local teacher outputs and extracted trajectories."""
+    if num <= 0:
+        return []
+
+    seen: set[str] = set()
+    questions: list[str] = []
+
+    teacher_questions = _load_questions_from_teacher_dir(teacher_dir)
+    weave_questions = _load_questions_from_weave_dir(weave_dir)
+
+    print(
+        f"Question sources: teacher={len(teacher_questions)}, "
+        f"weave={len(weave_questions)}"
+    )
 
     random.seed(42)
-    random.shuffle(questions)
+    random.shuffle(teacher_questions)
+    random.shuffle(weave_questions)
+
+    _extend_unique_questions(questions, seen, teacher_questions)
+    _extend_unique_questions(questions, seen, weave_questions)
+
+    if not questions:
+        return []
+    if len(questions) >= num:
+        return questions[:num]
+
+    # If local sources are smaller than requested, recycle them with replacement
+    # to keep augmentation running without forcing a benchmark dataset download.
+    recycled = list(questions)
+    while len(questions) < num:
+        questions.append(recycled[(len(questions) - len(recycled)) % len(recycled)])
     return questions[:num]
 
 
@@ -85,29 +164,44 @@ def collect_questions(num: int) -> list[str]:
 
 async def generate_intents(questions: list[str], output_path: Path) -> list[dict]:
     """Generate intent clarifications for each question."""
-    agent = Agent(
-        name="IntentGenerator",
-        instructions=EVAL_INTENT_CLARIFICATION_PROMPT,
-        model=create_model(),
-    )
+    if not questions:
+        _save_jsonl([], output_path)
+        print("Generated 0 intent examples")
+        return []
 
-    results = []
-    for i, q in enumerate(questions):
+    semaphore = asyncio.Semaphore(DEFAULT_AUGMENT_CONCURRENCY)
+    completed = 0
+    lock = asyncio.Lock()
+
+    async def run_one(i: int, q: str):
+        nonlocal completed
         try:
-            result = await Runner.run(agent, f"User question: {q}", max_turns=1)
-            output = strip_think_block(result.final_output)
-            results.append({
+            async with semaphore:
+                agent = Agent(
+                    name="IntentGenerator",
+                    instructions=EVAL_INTENT_CLARIFICATION_PROMPT,
+                    model=create_model(),
+                    model_settings=ModelSettings(max_tokens=INTENT_MAX_TOKENS, verbosity="low"),
+                )
+                result = await Runner.run(agent, f"User question: {q}", max_turns=1)
+            record = {
                 "id": f"aug_intent_{i:03d}",
                 "phase": "intent",
                 "system": EVAL_INTENT_CLARIFICATION_PROMPT,
                 "user": f"User question: {q}",
-                "assistant": result.final_output,  # keep think blocks for training
-            })
-            if (i + 1) % 20 == 0:
-                print(f"  Intent: {i + 1}/{len(questions)}")
+                "assistant": result.final_output,
+            }
+            async with lock:
+                completed += 1
+                if completed % 20 == 0 or completed == len(questions):
+                    print(f"  Intent: {completed}/{len(questions)}", flush=True)
+            return i, record
         except Exception as e:
-            print(f"  Intent {i} failed: {e}")
+            print(f"  Intent {i} failed: {e}", flush=True)
+            return i, None
 
+    ordered_results = await asyncio.gather(*(run_one(i, q) for i, q in enumerate(questions)))
+    results = [record for _, record in sorted(ordered_results, key=lambda item: item[0]) if record is not None]
     _save_jsonl(results, output_path)
     print(f"Generated {len(results)} intent examples")
     return results
@@ -119,17 +213,19 @@ async def generate_intents(questions: list[str], output_path: Path) -> list[dict
 
 async def generate_plans(intents: list[dict], output_path: Path) -> list[dict]:
     """Generate search plans from intent outputs."""
-    agent = Agent(
-        name="PlanGenerator",
-        instructions=EVAL_PLANNING_PROMPT,
-        model=create_model(),
-    )
+    if not intents:
+        _save_jsonl([], output_path)
+        print("Generated 0 planning examples")
+        return []
 
-    results = []
-    for i, intent in enumerate(intents):
+    semaphore = asyncio.Semaphore(DEFAULT_AUGMENT_CONCURRENCY)
+    completed = 0
+    lock = asyncio.Lock()
+
+    async def run_one(i: int, intent: dict):
+        nonlocal completed
         question = intent["user"].replace("User question: ", "")
         clarified = strip_think_block(intent["assistant"])
-
         message = f"""
 Based on this research intent, create a search plan:
 
@@ -143,19 +239,32 @@ Local Context Available: No
 Output a JSON array of search objectives.
 """
         try:
-            result = await Runner.run(agent, message, max_turns=1)
-            results.append({
+            async with semaphore:
+                agent = Agent(
+                    name="PlanGenerator",
+                    instructions=EVAL_PLANNING_PROMPT,
+                    model=create_model(),
+                    model_settings=ModelSettings(max_tokens=PLAN_MAX_TOKENS, verbosity="low"),
+                )
+                result = await Runner.run(agent, message, max_turns=1)
+            record = {
                 "id": f"aug_planning_{i:03d}",
                 "phase": "planning",
                 "system": EVAL_PLANNING_PROMPT,
                 "user": message,
                 "assistant": result.final_output,
-            })
-            if (i + 1) % 20 == 0:
-                print(f"  Planning: {i + 1}/{len(intents)}")
+            }
+            async with lock:
+                completed += 1
+                if completed % 20 == 0 or completed == len(intents):
+                    print(f"  Planning: {completed}/{len(intents)}", flush=True)
+            return i, record
         except Exception as e:
-            print(f"  Planning {i} failed: {e}")
+            print(f"  Planning {i} failed: {e}", flush=True)
+            return i, None
 
+    ordered_results = await asyncio.gather(*(run_one(i, intent) for i, intent in enumerate(intents)))
+    results = [record for _, record in sorted(ordered_results, key=lambda item: item[0]) if record is not None]
     _save_jsonl(results, output_path)
     print(f"Generated {len(results)} planning examples")
     return results
@@ -171,11 +280,10 @@ async def generate_answers(
     num: int = 100,
 ) -> list[dict]:
     """Generate final answers using real collected sources."""
-    agent = Agent(
-        name="AnswerGenerator",
-        instructions=EVAL_ANSWER_PROMPT,
-        model=create_model(),
-    )
+    if num <= 0 or not search_trajs:
+        _save_jsonl([], output_path)
+        print("Generated 0 answer examples")
+        return []
 
     # Build (question, sources) pairs from search trajectories
     pairs = []
@@ -196,8 +304,12 @@ async def generate_answers(
     random.shuffle(pairs)
     pairs = pairs[:num]
 
-    results = []
-    for i, (question, sources_text) in enumerate(pairs):
+    semaphore = asyncio.Semaphore(DEFAULT_AUGMENT_CONCURRENCY)
+    completed = 0
+    lock = asyncio.Lock()
+
+    async def run_one(i: int, question: str, sources_text: str):
+        nonlocal completed
         message = f"""
 Question: {question}
 
@@ -205,19 +317,34 @@ Collected Research Sources:
 {sources_text}
 """
         try:
-            result = await Runner.run(agent, message, max_turns=1)
-            results.append({
+            async with semaphore:
+                agent = Agent(
+                    name="AnswerGenerator",
+                    instructions=EVAL_ANSWER_PROMPT,
+                    model=create_model(),
+                    model_settings=ModelSettings(max_tokens=ANSWER_MAX_TOKENS, verbosity="low"),
+                )
+                result = await Runner.run(agent, message, max_turns=1)
+            record = {
                 "id": f"aug_answer_{i:03d}",
                 "phase": "answer",
                 "system": EVAL_ANSWER_PROMPT,
                 "user": message,
                 "assistant": result.final_output,
-            })
-            if (i + 1) % 20 == 0:
-                print(f"  Answer: {i + 1}/{len(pairs)}")
+            }
+            async with lock:
+                completed += 1
+                if completed % 20 == 0 or completed == len(pairs):
+                    print(f"  Answer: {completed}/{len(pairs)}", flush=True)
+            return i, record
         except Exception as e:
-            print(f"  Answer {i} failed: {e}")
+            print(f"  Answer {i} failed: {e}", flush=True)
+            return i, None
 
+    ordered_results = await asyncio.gather(
+        *(run_one(i, question, sources_text) for i, (question, sources_text) in enumerate(pairs))
+    )
+    results = [record for _, record in sorted(ordered_results, key=lambda item: item[0]) if record is not None]
     _save_jsonl(results, output_path)
     print(f"Generated {len(results)} answer examples")
     return results
@@ -237,19 +364,21 @@ async def augment_search_with_reuse(
     For each trajectory, we keep the system prompt, user message, and ALL tool
     responses fixed. We let the teacher model regenerate the assistant messages.
     """
-    agent = Agent(
-        name="SearchAugmenter",
-        instructions=EVAL_SYSTEM_PROMPT,
-        model=create_model(),
-        tools=[],  # no tools needed — we inject observations manually
-    )
+    if num <= 0 or not search_trajs:
+        _save_jsonl([], output_path)
+        print("Generated 0 search-reuse examples")
+        return []
 
     trajs_with_tools = [t for t in search_trajs if t["n_tool_responses"] >= 2]
     random.shuffle(trajs_with_tools)
     trajs_with_tools = trajs_with_tools[:num]
 
-    results = []
-    for i, traj in enumerate(trajs_with_tools):
+    semaphore = asyncio.Semaphore(DEFAULT_AUGMENT_CONCURRENCY)
+    completed = 0
+    lock = asyncio.Lock()
+
+    async def run_one(i: int, traj: dict):
+        nonlocal completed
         msgs = traj["messages"]
         # Build a "guided replay" prompt: include the original user message
         # and all observations, ask the teacher to reason through them
@@ -267,7 +396,7 @@ async def augment_search_with_reuse(
                     tools_used.append(f'{fn.get("name", "")}({json.dumps(fn.get("arguments", ""))[:100]})')
 
         if not observations or not user_msg:
-            continue
+            return i, None
 
         replay_prompt = f"""{user_msg}
 
@@ -278,20 +407,33 @@ Below are the tool results already collected. Based on these results, provide yo
 Analyze all the above tool results and report the key findings for this research objective.
 """
         try:
-            result = await Runner.run(agent, replay_prompt, max_turns=1)
-            # Store as a simplified trajectory (no tool calls, just analysis)
-            results.append({
+            async with semaphore:
+                agent = Agent(
+                    name="SearchAugmenter",
+                    instructions=EVAL_SYSTEM_PROMPT,
+                    model=create_model(),
+                    tools=[],
+                    model_settings=ModelSettings(max_tokens=REUSE_MAX_TOKENS, verbosity="low"),
+                )
+                result = await Runner.run(agent, replay_prompt, max_turns=1)
+            record = {
                 "id": f"aug_search_reuse_{i:03d}",
                 "phase": "search_reuse",
                 "system": EVAL_SYSTEM_PROMPT,
                 "user": replay_prompt,
                 "assistant": result.final_output,
-            })
-            if (i + 1) % 10 == 0:
-                print(f"  Search reuse: {i + 1}/{len(trajs_with_tools)}")
+            }
+            async with lock:
+                completed += 1
+                if completed % 10 == 0 or completed == len(trajs_with_tools):
+                    print(f"  Search reuse: {completed}/{len(trajs_with_tools)}", flush=True)
+            return i, record
         except Exception as e:
-            print(f"  Search reuse {i} failed: {e}")
+            print(f"  Search reuse {i} failed: {e}", flush=True)
+            return i, None
 
+    ordered_results = await asyncio.gather(*(run_one(i, traj) for i, traj in enumerate(trajs_with_tools)))
+    results = [record for _, record in sorted(ordered_results, key=lambda item: item[0]) if record is not None]
     _save_jsonl(results, output_path)
     print(f"Generated {len(results)} search-reuse examples")
     return results
@@ -333,7 +475,7 @@ async def run(args):
 
     # 1. Intent generation
     print("\n=== Generating synthetic intents ===")
-    questions = collect_questions(args.num_intent)
+    questions = collect_questions(args.num_intent, args.weave_dir, args.teacher_dir)
     intents = await generate_intents(questions, output_dir / "intent_examples.jsonl")
 
     # 2. Planning generation
@@ -341,7 +483,7 @@ async def run(args):
     await generate_plans(intents[:args.num_intent], output_dir / "planning_examples.jsonl")
 
     # 3. Answer generation (needs search trajectories)
-    if search_trajs:
+    if search_trajs and (args.num_answer > 0 or args.num_reuse > 0):
         print("\n=== Generating synthetic answers ===")
         await generate_answers(search_trajs, output_dir / "answer_examples.jsonl", num=args.num_answer)
 
@@ -349,7 +491,12 @@ async def run(args):
         print("\n=== Generating search-reuse examples ===")
         await augment_search_with_reuse(search_trajs, output_dir / "search_reuse_examples.jsonl", num=args.num_reuse)
     else:
-        print("\nSkipping answer/reuse augmentation: no search trajectories available")
+        if not search_trajs:
+            print("\nSkipping answer/reuse augmentation: no search trajectories available")
+        else:
+            _save_jsonl([], output_dir / "answer_examples.jsonl")
+            _save_jsonl([], output_dir / "search_reuse_examples.jsonl")
+            print("\nSkipping answer/reuse augmentation: requested counts are zero")
 
 
 def main():

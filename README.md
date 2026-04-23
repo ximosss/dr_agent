@@ -68,16 +68,32 @@ uv run run_agent.py --eval -b simpleqa -n 50
 
 Search/interact reports are written to `results/` as Markdown and are not printed to the terminal. Evaluation outputs go to `eval_outputs/`, and logs to `logs/`.
 
-## Structure
 
-```text
-dr_agent/
-├── run_agent.py    # CLI entrypoint
-├── agent.py        # Core agent logic
-├── models.py       # SearchObjective / ResearchPlan
-├── prompt.py       # Agent prompts
-└── tools/          # Active tool implementations
+## Training
+
+Training is driven from the scripts under `training/scripts/`.
+
+```bash
+# 1. Collect benchmark-train trajectories with the teacher model.
+bash training/scripts/run_teacher.sh
+
+# 2. Download Weave traces, extract trajectories, run augmentation,
+#    build ShareGPT SFT data, and launch LLaMA-Factory training.
+bash training/scripts/run_training.sh
+
+# 3. Merge the LoRA adapter and launch a local vLLM server.
+bash training/scripts/run_merge.sh
+
+# 4. Evaluate the merged model on the reserved benchmark test splits.
+bash training/scripts/run_eval.sh
 ```
+
+Notes:
+
+- `run_training.sh` now performs `uv sync --group training --inexact` internally; `training/scripts/setup_env.sh` is no longer needed.
+- Augmentation is enabled by default inside `run_training.sh` and uses the teacher endpoint at `http://localhost:8001/v1`. Override with `AUGMENT_BASE_URL`, `AUGMENT_MODEL_NAME`, `AUGMENT_NUM_INTENT`, `AUGMENT_NUM_ANSWER`, and `AUGMENT_NUM_REUSE` when needed.
+- `run_eval.sh` targets the merged model on `http://localhost:8000/v1` and lets you adjust benchmark sizes with `FRAMES_EVAL_N`, `SIMPLEQA_EVAL_N`, and `GAIA_EVAL_N`.
+
 
 ## Tools
 

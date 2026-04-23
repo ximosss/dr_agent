@@ -9,13 +9,12 @@ The output format matches what LLaMA-Factory expects with the `sharegpt` formatt
 and `qwen3` template, including proper tool call tags.
 
 Usage:
-    python training/convert_sharegpt.py [--input-dir PATH] [--output-dir PATH]
+    python training/convert_sharegpt.py [--weave-dir PATH] [--augmented-dir PATH] [--output-dir PATH]
 """
 from __future__ import annotations
 
 import argparse
 import json
-import re
 from pathlib import Path
 
 
@@ -57,34 +56,67 @@ def convert_search_trajectory(item: dict) -> dict | None:
         return None
 
     conversations = []
-
-    for msg in msgs:
+    pending_assistant_text = ""
+    idx = 0
+    while idx < len(msgs):
+        msg = msgs[idx]
         role = msg.get("role", "")
         content = str(msg.get("content", "") or "")
         tool_calls = msg.get("tool_calls") or []
 
         if role == "system":
             conversations.append({"from": "system", "value": content})
+            idx += 1
+            continue
 
-        elif role == "user":
+        if role == "user":
             conversations.append({"from": "human", "value": content})
+            idx += 1
+            continue
 
-        elif role == "assistant":
-            value = content
+        if role == "assistant":
             if tool_calls:
                 tc_text = convert_openai_to_qwen3_tool_call(tool_calls)
-                if value and not value.endswith("\n"):
-                    value += "\n"
-                value += tc_text
-            if value.strip():
-                conversations.append({"from": "gpt", "value": value})
+                function_parts = [part for part in [pending_assistant_text.strip(), content.strip(), tc_text] if part]
+                if function_parts:
+                    conversations.append({"from": "function", "value": "\n\n".join(function_parts)})
+                pending_assistant_text = ""
 
-        elif role == "tool":
-            # Truncate long tool responses
+                idx += 1
+                observations = []
+                while idx < len(msgs) and msgs[idx].get("role", "") == "tool":
+                    tool_content = str(msgs[idx].get("content", "") or "")
+                    truncated = tool_content[:MAX_TOOL_RESPONSE_CHARS]
+                    if len(tool_content) > MAX_TOOL_RESPONSE_CHARS:
+                        truncated += "\n[... truncated]"
+                    if truncated.strip():
+                        observations.append(truncated)
+                    idx += 1
+
+                if observations:
+                    conversations.append({"from": "observation", "value": "\n\n".join(observations)})
+                continue
+
+            if content.strip():
+                pending_assistant_text = "\n\n".join(
+                    [part for part in [pending_assistant_text.strip(), content.strip()] if part]
+                )
+            idx += 1
+            continue
+
+        if role == "tool":
             truncated = content[:MAX_TOOL_RESPONSE_CHARS]
             if len(content) > MAX_TOOL_RESPONSE_CHARS:
                 truncated += "\n[... truncated]"
-            conversations.append({"from": "observation", "value": truncated})
+            if truncated.strip():
+                conversations.append({"from": "observation", "value": truncated})
+            idx += 1
+            continue
+
+        idx += 1
+
+    if pending_assistant_text.strip():
+        conversations.append({"from": "gpt", "value": pending_assistant_text})
 
     # Validate: must have system + human + at least one gpt
     roles = [c["from"] for c in conversations]
@@ -95,7 +127,7 @@ def convert_search_trajectory(item: dict) -> dict | None:
     if conversations[-1]["from"] != "gpt":
         return None
 
-    result = {"conversations": conversations}
+    result = {"conversations": conversations, "tools": ""}
     if tools:
         result["tools"] = json.dumps(tools, ensure_ascii=False)
 
@@ -121,51 +153,79 @@ def convert_single_turn(item: dict) -> dict | None:
     conversations.append({"from": "human", "value": user})
     conversations.append({"from": "gpt", "value": assistant})
 
-    return {"conversations": conversations}
+    return {"conversations": conversations, "tools": ""}
 
 
 # ---------------------------------------------------------------------------
 # Main conversion pipeline
 # ---------------------------------------------------------------------------
 
-def run_conversion(input_dir: Path, output_dir: Path) -> dict:
-    """Convert all extracted data to ShareGPT format."""
+def _convert_search_file(path: Path) -> tuple[list[dict], int]:
+    if not path.exists():
+        return [], 0
+
+    items = _load_jsonl(path)
+    converted = []
+    for item in items:
+        result = convert_search_trajectory(item)
+        if result:
+            converted.append(result)
+    return converted, len(items)
+
+
+def _convert_single_turn_file(path: Path) -> tuple[list[dict], int]:
+    if not path.exists():
+        return [], 0
+
+    items = _load_jsonl(path)
+    converted = []
+    for item in items:
+        result = convert_single_turn(item)
+        if result:
+            converted.append(result)
+    return converted, len(items)
+
+
+def run_conversion(weave_dir: Path, augmented_dir: Path, output_dir: Path) -> dict:
+    """Convert extracted + augmented data to ShareGPT format."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    stats = {}
+    stats = {"sources": {}}
 
-    # --- Search trajectories ---
-    search_path = input_dir / "search_trajectories.jsonl"
-    if search_path.exists():
-        search_items = _load_jsonl(search_path)
+    search_data, search_total = _convert_search_file(weave_dir / "search_trajectories.jsonl")
+    _save_json(search_data, output_dir / "search.json")
+    stats["search"] = len(search_data)
+    stats["sources"]["search"] = {"converted": len(search_data), "raw": search_total}
+    print(f"Converted {len(search_data)}/{search_total} search trajectories")
+
+    single_turn_sources = {
+        "intent": [
+            weave_dir / "intent_examples.jsonl",
+            augmented_dir / "intent_examples.jsonl",
+        ],
+        "planning": [
+            weave_dir / "planning_examples.jsonl",
+            augmented_dir / "planning_examples.jsonl",
+        ],
+        "answer": [
+            weave_dir / "answer_examples.jsonl",
+            augmented_dir / "answer_examples.jsonl",
+        ],
+        "search_reuse": [
+            augmented_dir / "search_reuse_examples.jsonl",
+        ],
+    }
+
+    for phase, paths in single_turn_sources.items():
         converted = []
-        for item in search_items:
-            result = convert_search_trajectory(item)
-            if result:
-                converted.append(result)
-        _save_json(converted, output_dir / "search.json")
-        stats["search"] = len(converted)
-        print(f"Converted {len(converted)}/{len(search_items)} search trajectories")
-    else:
-        stats["search"] = 0
-        print(f"No search trajectories found at {search_path}")
-
-    # --- Single-turn phases ---
-    for phase in ["intent", "planning", "answer"]:
-        phase_path = input_dir / f"{phase}_examples.jsonl"
-        if not phase_path.exists():
-            stats[phase] = 0
-            print(f"No {phase} examples found at {phase_path}")
-            continue
-
-        items = _load_jsonl(phase_path)
-        converted = []
-        for item in items:
-            result = convert_single_turn(item)
-            if result:
-                converted.append(result)
+        raw_total = 0
+        for path in paths:
+            phase_converted, phase_raw = _convert_single_turn_file(path)
+            converted.extend(phase_converted)
+            raw_total += phase_raw
         _save_json(converted, output_dir / f"{phase}.json")
         stats[phase] = len(converted)
-        print(f"Converted {len(converted)}/{len(items)} {phase} examples")
+        stats["sources"][phase] = {"converted": len(converted), "raw": raw_total}
+        print(f"Converted {len(converted)}/{raw_total} {phase} examples")
 
     # Save stats
     stats_path = output_dir / "conversion_stats.json"
@@ -194,9 +254,14 @@ def _save_json(items: list[dict], path: Path) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Convert to ShareGPT format")
     parser.add_argument(
-        "--input-dir",
+        "--weave-dir",
         type=Path,
         default=Path("training/data/weave_extracted"),
+    )
+    parser.add_argument(
+        "--augmented-dir",
+        type=Path,
+        default=Path("training/data/augmented"),
     )
     parser.add_argument(
         "--output-dir",
@@ -204,7 +269,7 @@ def main():
         default=Path("training/data/sft_ready"),
     )
     args = parser.parse_args()
-    run_conversion(args.input_dir, args.output_dir)
+    run_conversion(args.weave_dir, args.augmented_dir, args.output_dir)
 
 
 if __name__ == "__main__":

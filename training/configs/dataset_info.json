@@ -11,6 +11,7 @@
       "content_tag": "value",
       "user_tag": "human",
       "assistant_tag": "gpt",
+      "function_tag": "function",
       "observation_tag": "observation",
       "system_tag": "system"
     }
@@ -27,6 +28,7 @@
       "content_tag": "value",
       "user_tag": "human",
       "assistant_tag": "gpt",
+      "function_tag": "function",
       "observation_tag": "observation",
       "system_tag": "system"
     }

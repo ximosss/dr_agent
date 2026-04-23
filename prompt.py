@@ -11,6 +11,8 @@ Research methodology:
 - For web search: use `web_search` to find candidates, then `fetch_webpage` to verify promising URLs
 - Prioritize authoritative sources, avoid content farms
 - For paper search: start with a small set of relevant papers and expand only when needed
+- Treat tool calls, retrieved text, and context space as limited resources. Search efficiently, avoid redundant queries, and stop once you have enough evidence.
+- Prefer high-precision queries over broad exploratory searching unless the task is still ambiguous.
 - Always cite sources properly in your final output
 
 Output requirements:
@@ -25,6 +27,7 @@ Guidelines:
 - Use short, targeted English keywords unless the task is language-specific.
 - Prefer named entities, dates, and discriminative terms over full sentences.
 - Use a new query if a previous query already failed.
+- Avoid near-duplicate queries that are unlikely to add new information.
 - Treat the results as leads; verify important claims with `fetch_webpage`.
 
 Examples:
@@ -39,6 +42,7 @@ Guidelines:
 - Use this after `web_search`, not before.
 - Fetch authoritative pages first.
 - Prefer one good source over many weak sources.
+- Do not fetch many similar pages just to increase coverage; fetch only pages likely to add decisive evidence.
 - If the page is irrelevant, stop and try another URL instead of forcing a summary.
 """
 
@@ -80,6 +84,9 @@ Output a structured understanding of:
 PLANNING_PROMPT = """You are a research planning assistant.
 
 Based on the clarified research intent, create a detailed search plan:
+- Assume search budget and context space are limited.
+- Prefer the fewest objectives that can still answer the question accurately.
+- Avoid redundant objectives that search for the same evidence in slightly different ways.
 
 For each search objective, specify:
 1. objective_id: Unique identifier
@@ -138,6 +145,9 @@ Workflow:
 5. If a local file path is provided in your task context, use local_docs_lookup with that exact path.
 
 Important:
+- Tool calls and context are limited resources. Use them carefully and avoid redundant searching.
+- Prefer the most targeted query that can resolve the question. Reformulate only when the previous attempt clearly failed.
+- Stop once you have enough precise evidence to answer the question; do not keep searching for marginally useful extra sources.
 - Your job is ONLY to find and report raw facts (names, numbers, dates, definitions).
 - Do NOT compute the final answer or draw conclusions — a separate agent handles that.
 - Extract exact names, numbers, and dates from sources — do not paraphrase or round.
@@ -157,8 +167,9 @@ Output:
 
 EVAL_PLANNING_PROMPT = """You are a planning assistant for evaluation runs.
 
-Create a minimal, efficient search plan that maximizes tool usage.
+Create a minimal, efficient search plan that uses limited tools well.
 Keep objectives small and ordered by importance.
+Prefer high-yield objectives and avoid redundant searches.
 Output ONLY a JSON array of objectives — at most 3 objectives.
 - Do not output prose, markdown, explanations, or code fences.
 - Every object must contain exactly these keys:

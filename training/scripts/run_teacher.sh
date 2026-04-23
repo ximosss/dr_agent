@@ -1,81 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Step 2: Teacher Data Collection ==="
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
-TEACHER_MODEL="/data/qwen3.5-122b-a10b-gptq-int4"
-TEACHER_PORT=8001
+echo "=== Step 2: Teacher Trajectory Collection ==="
+echo "Assuming teacher-vllm is already running on http://localhost:8001/v1"
+STOP_TEACHER_ON_EXIT="${STOP_TEACHER_ON_EXIT:-0}"
+FRAMES_TRAIN_N="${FRAMES_TRAIN_N:-50}"
+SIMPLEQA_TRAIN_N="${SIMPLEQA_TRAIN_N:-50}"
+GAIA_TRAIN_N="${GAIA_TRAIN_N:-20}"
 
-# Check if teacher model is downloaded
-if [ ! -d "$TEACHER_MODEL" ]; then
-    echo "ERROR: Teacher model not found at $TEACHER_MODEL"
-    echo "Download it first:"
-    echo "  huggingface-cli download Qwen/Qwen3.5-122B-A10B-GPTQ-Int4 --local-dir $TEACHER_MODEL"
-    exit 1
-fi
+# You need to start the teacher manually, for example:
+# docker run --name teacher-vllm \
+#   --gpus '"device=0,1"' \
+#   --ipc=host \
+#   -e NCCL_P2P_DISABLE=1 \
+#   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   -v /data:/datas \
+#   -p 8001:8000 \
+#   vllm/vllm-openai:latest \
+#   /datas/qwen3.5-122b-a10b-gptq-int4 \
+#   --served-model-name teacher \
+#   --language-model-only \
+#   --tensor-parallel-size 2 \
+#   --max-model-len 4096 \
+#   --gpu-memory-utilization 0.80 \
+#   --quantization moe_wna16 \
+#   --reasoning-parser qwen3 \
+#   --enable-auto-tool-choice \
+#   --tool-call-parser qwen3_coder \
+#   --enforce-eager \
+#   --disable-custom-all-reduce
 
-# 1. Stop the existing Qwen3-8B container
-echo "[1/5] Stopping Qwen3-8B container..."
-docker stop interesting_kepler || true
-sleep 3
-
-# 2. Start teacher model with TP=2 (both GPUs)
-echo "[2/5] Starting teacher model on 2xGPU (TP=2)..."
-docker run -d \
-    --name teacher-vllm \
-    --runtime nvidia \
-    --gpus all \
-    -v /data:/data \
-    -p ${TEACHER_PORT}:8000 \
-    vllm/vllm-openai:latest \
-    --model /data/qwen3.5-122b-a10b-gptq-int4 \
-    --served-model-name teacher \
-    --enable-auto-tool-choice \
-    --tool-call-parser hermes \
-    --tensor-parallel-size 2 \
-    --max-model-len 32768 \
-    --gpu-memory-utilization 0.90 \
-    --quantization gptq
-
-echo "Waiting for teacher model to load (~2-5 min)..."
-for i in $(seq 1 60); do
-    if curl -s http://localhost:${TEACHER_PORT}/v1/models | grep -q "teacher"; then
-        echo "Teacher model is ready!"
-        break
-    fi
-    sleep 5
-done
-
-# 3. Run data collection (overriding env vars)
-echo "[3/5] Collecting teacher trajectories..."
-cd /home/ubuntu/workspace/dr_agent
-
-export BASE_URL="http://localhost:${TEACHER_PORT}/v1"
+export BASE_URL="http://localhost:8001/v1"
 export MODEL_NAME_AT_ENDPOINT="teacher"
 
-# Collect from each benchmark (reserved train split only)
-uv run python training/collect_teacher.py -b frames -n 40
-uv run python training/collect_teacher.py -b simpleqa -n 20
-uv run python training/collect_teacher.py -b gaia -n 10 --text-only
+uv run python training/collect_teacher.py -b frames -n "${FRAMES_TRAIN_N}"
+uv run python training/collect_teacher.py -b simpleqa -n "${SIMPLEQA_TRAIN_N}"
+uv run python training/collect_teacher.py -b gaia -n "${GAIA_TRAIN_N}" --text-only
 
-# 4. Run augmentation (also uses teacher model, no Tavily)
-echo "[4/5] Running synthetic data augmentation..."
-uv run python training/augment_data.py --num-intent 150 --num-answer 100 --num-reuse 40
+if [ "${STOP_TEACHER_ON_EXIT}" = "1" ]; then
+    docker stop teacher-vllm
+    docker rm teacher-vllm
+fi
 
-# 5. Stop teacher and restore Qwen3-8B
-echo "[5/5] Cleaning up..."
-docker stop teacher-vllm || true
-docker rm teacher-vllm || true
-docker start interesting_kepler
-
-echo "Waiting for Qwen3-8B to restore..."
-for i in $(seq 1 30); do
-    if curl -s http://localhost:8000/v1/models | grep -q "qwen3-8b"; then
-        echo "Qwen3-8B restored!"
-        break
-    fi
-    sleep 5
-done
-
-echo "Export the new Weave traces to a local weave_export_*.jsonl before rerunning training/extract_weave.py."
-echo "=== Teacher data collection complete ==="
+echo "Teacher collection complete."
+echo "Next step: bash training/scripts/run_training.sh"
