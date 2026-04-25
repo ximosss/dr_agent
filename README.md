@@ -14,6 +14,7 @@ DR-Agent 是一个面向深度研究场景的轻量级 Agent，基于 OpenAI Age
 ![workflow](./imgs/dr_agent.png)
 
 具体参见WandB主页: https://wandb.ai/ximo_ml/deep_research_agent
+
 和项目实验报告: https://wandb.ai/ximo_ml/deep_research_agent/reports/Deep-Research-Agent--VmlldzoxNjY2MzEwMA 
 
 ## 安装
