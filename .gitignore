@@ -24,3 +24,4 @@ training/data/weave_extracted
 training/data/sft_ready
 training/data/augmented
 training/data/teacher_collected
+scripts/
